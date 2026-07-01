@@ -294,11 +294,12 @@ void drawFrame(HWND hwnd) {
         D2D1::RectF(leftCard.right - 260, leftCard.top + 24, leftCard.right - 32, leftCard.top + 48),
         g->fmtSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
+    // Date/weekday on top, big clock below it.
     float clockCenterY = leftCard.top + (leftCard.bottom - leftCard.top) / 2.0f;
-    text(formatClock(st), D2D1::RectF(leftCard.left, clockCenterY - 110, leftCard.right, clockCenterY + 70),
-        g->fmtClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(formatDate(st), D2D1::RectF(leftCard.left, clockCenterY + 78, leftCard.right, clockCenterY + 120),
+    text(formatDate(st), D2D1::RectF(leftCard.left, clockCenterY - 148, leftCard.right, clockCenterY - 106),
         g->fmtDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(formatClock(st), D2D1::RectF(leftCard.left, clockCenterY - 90, leftCard.right, clockCenterY + 90),
+        g->fmtClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // ---- Right: 교시 및 시험 시간 ----
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
