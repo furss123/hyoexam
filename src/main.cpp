@@ -82,6 +82,7 @@ struct AppState {
     IDWriteTextFormat* fmtBody = nullptr;
     IDWriteTextFormat* fmtSmall = nullptr;
     IDWriteTextFormat* fmtVersion = nullptr;
+    IDWriteTextFormat* fmtIcon = nullptr;
 
     Settings settings;
     ScheduleStore scheduleStore;
@@ -89,11 +90,14 @@ struct AppState {
 
     bool settingsOpen = false;
     bool fullscreen = false;
+    bool editMode = false; // placeholder toggle; behavior TBD with the user
     WINDOWPLACEMENT prevPlacement{ sizeof(WINDOWPLACEMENT) };
 
     // Hit-test rects for the settings modal, recomputed each frame it's drawn.
     D2D1_RECT_F rectClose{};
     D2D1_RECT_F rectGear{};
+    D2D1_RECT_F rectEditMode{};
+    D2D1_RECT_F rectFullscreenBtn{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
     D2D1_RECT_F rectThemeDark{}, rectThemeLight{}, rectThemeAuto{};
 };
@@ -137,6 +141,9 @@ void createDeviceIndependentResources() {
     g->fmtBody = makeFormat(L"Pretendard", 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmall = makeFormat(L"Pretendard", 15.0f, DWRITE_FONT_WEIGHT_NORMAL);
     g->fmtVersion = makeFormat(L"JetBrains Mono", 13.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    // Segoe MDL2 Assets ships with Windows 10/11 and is what Explorer/Settings use
+    // for their own toolbar glyphs — crisper and more reliable than emoji fallback.
+    g->fmtIcon = makeFormat(L"Segoe MDL2 Assets", 17.0f, DWRITE_FONT_WEIGHT_NORMAL);
 
     g->fmtClock->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 }
@@ -297,11 +304,27 @@ void drawFrame(HWND hwnd) {
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
     float rx = rightCard.left + 24;
     float ry = rightCard.top + 20;
-    text(L"교시별 시험 시간", D2D1::RectF(rx, ry, rightCard.right - 60, ry + 30), g->fmtHeading, pal.textPrimary);
 
-    g->rectGear = D2D1::RectF(rightCard.right - 52, ry - 4, rightCard.right - 16, ry + 32);
+    // Top-right icon row: edit mode / fullscreen / settings — same pill style as
+    // each other so they read as one control group, ordered by how often they're used.
+    float iconSize = 36, iconGap = 8;
+    float iconsRight = rightCard.right - 24;
+    float iconsLeft = iconsRight - (iconSize * 3 + iconGap * 2);
+    float iconTop = ry - 6;
+
+    text(L"교시별 시험 시간", D2D1::RectF(rx, ry, iconsLeft - 12, ry + 30), g->fmtHeading, pal.textPrimary);
+
+    g->rectEditMode = D2D1::RectF(iconsLeft, iconTop, iconsLeft + iconSize, iconTop + iconSize);
+    roundedRect(g->rectEditMode, 10, g->editMode ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.12f));
+    text(L"", g->rectEditMode, g->fmtIcon, g->editMode ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    g->rectFullscreenBtn = D2D1::RectF(iconsLeft + iconSize + iconGap, iconTop, iconsLeft + iconSize * 2 + iconGap, iconTop + iconSize);
+    roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
+    text(g->fullscreen ? L"" : L"", g->rectFullscreenBtn, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    g->rectGear = D2D1::RectF(iconsLeft + (iconSize + iconGap) * 2, iconTop, iconsRight, iconTop + iconSize);
     roundedRect(g->rectGear, 10, hex(kHyoBlue, 0.12f));
-    text(L"⚙", g->rectGear, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(L"", g->rectGear, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
     ry += 50;
 
     ScheduleStatus status{};
@@ -419,6 +442,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         } else if (ptInRect(pt, g->rectGear)) {
             g->settingsOpen = true;
+        } else if (ptInRect(pt, g->rectFullscreenBtn)) {
+            toggleFullscreen(hwnd);
+        } else if (ptInRect(pt, g->rectEditMode)) {
+            g->editMode = !g->editMode;
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
