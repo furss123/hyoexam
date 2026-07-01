@@ -9,7 +9,7 @@ namespace hyo {
 enum class Theme { Dark, Light, Auto };
 
 struct Settings {
-    Theme theme = Theme::Dark;
+    Theme theme = Theme::Auto; // default: follow the Windows light/dark setting
     float fontScale = 1.0f;       // 0.8..1.5
     float splitRatio = 0.70f;     // left (clock) panel share of the content width
     std::wstring activeScheduleId;

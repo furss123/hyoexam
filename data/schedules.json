@@ -24,7 +24,7 @@
     },
     {
       "id": "midterm",
-      "name": "내신 (중간·기말고사)",
+      "name": "지필평가",
       "grade": "",
       "periods": [
         { "label": "1교시", "subject": "국어", "durationMinutes": 50, "start": "09:00", "end": "09:50" },

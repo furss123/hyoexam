@@ -44,8 +44,8 @@ bool Settings::load() {
     ss << f.rdbuf();
     auto root = hyo::json::parse(ss.str());
 
-    std::string themeStr = root["theme"].asString("dark");
-    theme = themeStr == "light" ? Theme::Light : themeStr == "auto" ? Theme::Auto : Theme::Dark;
+    std::string themeStr = root["theme"].asString("auto");
+    theme = themeStr == "light" ? Theme::Light : themeStr == "dark" ? Theme::Dark : Theme::Auto;
     fontScale = (float)root["fontScale"].asNumber(1.0);
     splitRatio = (float)root["splitRatio"].asNumber(0.70);
     activeScheduleId = utf8ToWide(root["activeScheduleId"].asString());

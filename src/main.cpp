@@ -101,16 +101,13 @@ struct AppState {
     TimeSync timeSync;
     std::wstring dataPath;
 
-    bool settingsOpen = false;
     bool fullscreen = false;
     WINDOWPLACEMENT prevPlacement{ sizeof(WINDOWPLACEMENT) };
 
-    // Hit-test rects for the settings modal, recomputed each frame it's drawn.
-    D2D1_RECT_F rectClose{};
-    D2D1_RECT_F rectGear{};
+    // Hit-test rects for the admin toolbar, recomputed each frame it's drawn.
     D2D1_RECT_F rectFullscreenBtn{};
+    D2D1_RECT_F rectThemeToggle{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
-    D2D1_RECT_F rectThemeDark{}, rectThemeLight{}, rectThemeAuto{};
 
     // Layout editing: draggable divider between the clock and timetable panels.
     D2D1_RECT_F rectSplitHandle{};
@@ -146,8 +143,23 @@ std::wstring wideExeDir() {
     return pos == std::wstring::npos ? L"." : s.substr(0, pos);
 }
 
+// Windows exposes the user's light/dark choice via this registry value (the same
+// one Explorer/Settings read) — 0 = dark, 1 = light. Missing/unreadable = dark.
+bool isSystemLightTheme() {
+    DWORD value = 0, size = sizeof(value);
+    LSTATUS st = RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return st == ERROR_SUCCESS && value != 0;
+}
+
+bool isEffectivelyLight() {
+    if (g->settings.theme == Theme::Auto) return isSystemLightTheme();
+    return g->settings.theme == Theme::Light;
+}
+
 const Palette currentPalette() {
-    return g->settings.theme == Theme::Light ? lightPalette() : darkPalette();
+    return isEffectivelyLight() ? lightPalette() : darkPalette();
 }
 
 const wchar_t* koreanWeekday(int wday) {
@@ -242,61 +254,6 @@ std::wstring formatDate(const SYSTEMTIME& st) {
     wchar_t buf[64];
     swprintf(buf, 64, L"%d월 %d일 (%s)", st.wMonth, st.wDay, koreanWeekday(st.wDayOfWeek));
     return buf;
-}
-
-// ---- Settings modal ----
-void drawSettingsModal(D2D1_SIZE_F size) {
-    Palette pal = currentPalette();
-    g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
-
-    float w = 640, h = 420;
-    D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
-    roundedRect(card, 16, pal.surface, &pal.cardBorder);
-
-    float pad = 28;
-    float x = card.left + pad;
-    float y = card.top + pad;
-
-    text(L"설정", D2D1::RectF(x, y, card.right - pad, y + 36), g->fmtHeading, pal.textPrimary);
-
-    g->rectClose = D2D1::RectF(card.right - pad - 90, y - 4, card.right - pad, y + 32);
-    roundedRect(g->rectClose, 8, hex(kHyoBlue, 0.12f));
-    text(L"✕ 닫기", g->rectClose, g->fmtSmall, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    y += 56;
-
-    // Section: exam type
-    text(L"시험 유형", D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtBody, pal.textSecondary);
-    y += 34;
-    g->scheduleButtons.clear();
-    float bx = x;
-    for (auto& sc : g->scheduleStore.all()) {
-        float bw = 150;
-        D2D1_RECT_F r = D2D1::RectF(bx, y, bx + bw, y + 44);
-        bool active = sc.id == g->scheduleStore.activeId();
-        roundedRect(r, 10, active ? hex(kHyoBlue, 0.22f) : hex(0x808080, 0.08f), active ? nullptr : &pal.cardBorder);
-        text(sc.name, r, g->fmtSmall, active ? hex(kHyoBlue) : pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
-        g->scheduleButtons.push_back({ r, sc.id });
-        bx += bw + 12;
-    }
-    y += 44 + 28;
-
-    // Section: theme
-    text(L"테마", D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtBody, pal.textSecondary);
-    y += 34;
-    auto themeBtn = [&](float bx2, const wchar_t* label, Theme t) {
-        D2D1_RECT_F r = D2D1::RectF(bx2, y, bx2 + 120, y + 40);
-        bool active = g->settings.theme == t;
-        roundedRect(r, 10, active ? hex(kHyoBlue, 0.22f) : hex(0x808080, 0.08f), active ? nullptr : &pal.cardBorder);
-        text(label, r, g->fmtSmall, active ? hex(kHyoBlue) : pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
-        return r;
-    };
-    g->rectThemeDark = themeBtn(x, L"다크", Theme::Dark);
-    g->rectThemeLight = themeBtn(x + 132, L"라이트", Theme::Light);
-    g->rectThemeAuto = themeBtn(x + 264, L"자동", Theme::Auto);
-
-    text(L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.",
-        D2D1::RectF(x, card.bottom - pad - 20, card.right - pad, card.bottom - pad), g->fmtVersion, pal.textTertiary);
 }
 
 // ---- Period add/edit popup ----
@@ -444,24 +401,38 @@ void drawFrame(HWND hwnd) {
     // notices/footer strip.
     D2D1_RECT_F content = D2D1::RectF(pad, pad + topBarHeight, size.width - pad, size.height - pad - noticeHeight - footerHeight);
 
-    // Admin toolbar (settings, fullscreen) sits above both cards — global app
-    // controls, not tied to either panel. Hidden entirely in fullscreen.
+    // Admin toolbar sits above both cards -- global app controls, not tied to
+    // either panel. Hidden entirely in fullscreen (student-facing display).
     if (!g->fullscreen) {
         float iconSize = 36, iconGap = 8;
         float iconsRight = size.width - pad;
         float iconTop = pad;
 
-        // Order swapped from the old in-card toolbar: settings first, fullscreen last.
-        g->rectGear = D2D1::RectF(iconsRight - iconSize * 2 - iconGap, iconTop, iconsRight - iconSize - iconGap, iconTop + iconSize);
-        roundedRect(g->rectGear, 10, hex(kHyoBlue, 0.12f));
-        text(L"", g->rectGear, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-
+        // Right side: theme toggle immediately left of fullscreen.
         g->rectFullscreenBtn = D2D1::RectF(iconsRight - iconSize, iconTop, iconsRight, iconTop + iconSize);
         roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
         text(g->fullscreen ? L"" : L"", g->rectFullscreenBtn, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        g->rectThemeToggle = D2D1::RectF(iconsRight - iconSize * 2 - iconGap, iconTop, iconsRight - iconSize - iconGap, iconTop + iconSize);
+        roundedRect(g->rectThemeToggle, 10, hex(kHyoBlue, 0.12f));
+        text(isEffectivelyLight() ? L"" : L"", g->rectThemeToggle, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Left side: exam-type selector (모의고사 / 지필평가).
+        g->scheduleButtons.clear();
+        float bx = pad;
+        for (auto& sc : g->scheduleStore.all()) {
+            float bw = 140;
+            D2D1_RECT_F r = D2D1::RectF(bx, iconTop, bx + bw, iconTop + iconSize);
+            bool isActive = sc.id == g->scheduleStore.activeId();
+            roundedRect(r, 10, isActive ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f), isActive ? nullptr : &pal.cardBorder);
+            text(sc.name, r, g->fmtSmall, isActive ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+            g->scheduleButtons.push_back({ r, sc.id });
+            bx += bw + 10;
+        }
     } else {
-        g->rectGear = D2D1::RectF(0, 0, 0, 0);
         g->rectFullscreenBtn = D2D1::RectF(0, 0, 0, 0);
+        g->rectThemeToggle = D2D1::RectF(0, 0, 0, 0);
+        g->scheduleButtons.clear();
     }
 
     // Left column: clock. Right column: today's period timetable. Split is
@@ -591,7 +562,6 @@ void drawFrame(HWND hwnd) {
             g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
-    if (g->settingsOpen) drawSettingsModal(size);
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
     if (g->editingNotices) drawNoticeEditor(size);
 
@@ -617,7 +587,6 @@ void toggleFullscreen(HWND hwnd) {
         }
         g->fullscreen = true;
         // Fullscreen is the student-facing display — always land on a clean view.
-        g->settingsOpen = false;
         g->editingPeriodIndex = -1;
         g->editingNotices = false;
         g->draggingSplit = false;
@@ -794,20 +763,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (g->editingNotices) {
             if (ptInRect(pt, g->rectNoticeSave)) saveNoticeEditor();
             else if (ptInRect(pt, g->rectNoticeCancel)) g->editingNotices = false;
-        } else if (g->settingsOpen) {
-            if (ptInRect(pt, g->rectClose)) { g->settingsOpen = false; g->settings.save(); }
-            else if (ptInRect(pt, g->rectThemeDark)) { g->settings.theme = Theme::Dark; g->settings.save(); }
-            else if (ptInRect(pt, g->rectThemeLight)) { g->settings.theme = Theme::Light; g->settings.save(); }
-            else if (ptInRect(pt, g->rectThemeAuto)) { g->settings.theme = Theme::Auto; g->settings.save(); }
-            else {
-                for (auto& [r, id] : g->scheduleButtons) {
-                    if (ptInRect(pt, r)) { g->scheduleStore.setActive(id); g->settings.activeScheduleId = id; g->settings.save(); break; }
-                }
-            }
-        } else if (ptInRect(pt, g->rectGear)) {
-            g->settingsOpen = true;
         } else if (ptInRect(pt, g->rectFullscreenBtn)) {
             toggleFullscreen(hwnd);
+        } else if (ptInRect(pt, g->rectThemeToggle)) {
+            g->settings.theme = isEffectivelyLight() ? Theme::Dark : Theme::Light;
+            g->settings.save();
         } else if (!g->fullscreen && ptInRect(pt, g->rectSplitHandle)) {
             g->draggingSplit = true;
         } else if (!g->fullscreen && ptInRect(pt, g->rectAddPeriod)) {
@@ -816,6 +776,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             openNoticeEditor();
         } else if (!g->fullscreen) {
             bool handled = false;
+            for (auto& [r, id] : g->scheduleButtons) {
+                if (ptInRect(pt, r)) { g->scheduleStore.setActive(id); g->settings.activeScheduleId = id; g->settings.save(); handled = true; break; }
+            }
             for (size_t i = 0; i < g->periodDeleteRects.size() && !handled; i++) {
                 if (ptInRect(pt, g->periodDeleteRects[i])) { deletePeriodAt((int)i); handled = true; }
             }
@@ -842,9 +805,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == VK_F11) toggleFullscreen(hwnd);
         else if (wParam == VK_ESCAPE && g->editingPeriodIndex != -1) { closePeriodEditor(); InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->editingNotices) { g->editingNotices = false; InvalidateRect(hwnd, nullptr, FALSE); }
-        else if (wParam == VK_ESCAPE && g->settingsOpen) { g->settingsOpen = false; g->settings.save(); InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->fullscreen) { toggleFullscreen(hwnd); }
-        else if (wParam == VK_F2) { g->settingsOpen = !g->settingsOpen; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, kTickTimerId);
