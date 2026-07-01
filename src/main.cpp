@@ -42,6 +42,16 @@ constexpr int kIdEditNotices = 105;
 // Korean UI font) — no bundling, no missing-font fallback surprises.
 constexpr wchar_t kUiFontFamily[] = L"맑은 고딕";
 
+// Time servers the clock can sync against (SNTP, UDP/123). Index persisted
+// in Settings::timeSourceIndex.
+struct TimeSourceOption { const wchar_t* host; const wchar_t* label; const wchar_t* description; };
+const TimeSourceOption kTimeSources[] = {
+    { L"time.navyism.com", L"네이버 시계", L"네이버에서 제공하는 표준시" },
+    { L"ntp.kriss.re.kr", L"KRISS", L"한국표준과학연구원 표준시" },
+    { L"time.bora.net", L"KISA", L"한국인터넷진흥원 표준시" },
+};
+constexpr int kTimeSourceCount = (int)(sizeof(kTimeSources) / sizeof(kTimeSources[0]));
+
 // ---- Brand palette (HyoT-brand-kit.md — do not introduce new hues) ----
 struct Palette {
     D2D1_COLOR_F base, surface, cardBorder;
@@ -109,6 +119,12 @@ struct AppState {
     D2D1_RECT_F rectFullscreenBtn{};
     D2D1_RECT_F rectThemeToggle{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
+
+    // Time-source dropdown (right of the exam-type buttons).
+    D2D1_RECT_F rectTimeSourceButton{};
+    bool timeSourceDropdownOpen = false;
+    D2D1_RECT_F timeSourceOptionRects[kTimeSourceCount]{};
+    int hoveredTimeSourceOption = -1;
 
     // Layout editing: draggable divider between the clock and timetable panels.
     D2D1_RECT_F rectSplitHandle{};
@@ -350,6 +366,40 @@ void drawNoticeEditor(D2D1_SIZE_F size) {
     text(L"저장", g->rectNoticeSave, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
+// Floating list under the time-source button — not a full modal, just a small
+// card, so the rest of the toolbar stays visible while choosing.
+void drawTimeSourceDropdown() {
+    Palette pal = currentPalette();
+    float rowH = 44;
+    float w = 260;
+    D2D1_RECT_F card = D2D1::RectF(g->rectTimeSourceButton.left, g->rectTimeSourceButton.bottom + 6,
+        g->rectTimeSourceButton.left + w, g->rectTimeSourceButton.bottom + 6 + rowH * kTimeSourceCount);
+    roundedRect(card, 12, pal.surface, &pal.cardBorder);
+
+    for (int i = 0; i < kTimeSourceCount; i++) {
+        D2D1_RECT_F row = D2D1::RectF(card.left + 6, card.top + 6 + i * rowH, card.right - 6, card.top + 6 + (i + 1) * rowH - 4);
+        bool isActive = i == g->settings.timeSourceIndex;
+        bool isHovered = i == g->hoveredTimeSourceOption;
+        if (isActive) roundedRect(row, 8, hex(kHyoBlue, 0.18f));
+        else if (isHovered) roundedRect(row, 8, hex(kHyoBlue, 0.08f));
+        text(kTimeSources[i].label, D2D1::RectF(row.left + 12, row.top, row.left + 100, row.bottom),
+            g->fmtSmall, isActive ? hex(kHyoBlue) : pal.textPrimary);
+        text(kTimeSources[i].host, D2D1::RectF(row.left + 100, row.top, row.right - 12, row.bottom),
+            g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        g->timeSourceOptionRects[i] = row;
+    }
+
+    // Hover tooltip: brief description, floating to the right of the list.
+    if (g->hoveredTimeSourceOption >= 0 && g->hoveredTimeSourceOption < kTimeSourceCount) {
+        const D2D1_RECT_F& row = g->timeSourceOptionRects[g->hoveredTimeSourceOption];
+        std::wstring desc = kTimeSources[g->hoveredTimeSourceOption].description;
+        float tipW = 200;
+        D2D1_RECT_F tip = D2D1::RectF(card.right + 10, row.top, card.right + 10 + tipW, row.top + rowH - 4);
+        roundedRect(tip, 8, pal.surface, &pal.cardBorder);
+        text(desc, D2D1::RectF(tip.left + 12, tip.top, tip.right - 12, tip.bottom), g->fmtVersion, pal.textSecondary);
+    }
+}
+
 // Shows/hides/positions the native Edit child controls to match whatever
 // Direct2D popup is currently open. Content (SetWindowText) is set once, at the
 // moment a popup opens — this only handles visibility and placement each tick.
@@ -440,10 +490,25 @@ void drawFrame(HWND hwnd) {
             g->scheduleButtons.push_back({ r, sc.id });
             bx += bw + 10;
         }
+
+        // Time-source dropdown button, right after the exam-type buttons.
+        bx += 6;
+        float dropdownW = 150;
+        g->rectTimeSourceButton = D2D1::RectF(bx, iconTop, bx + dropdownW, iconTop + iconSize);
+        roundedRect(g->rectTimeSourceButton, 10, hex(kHyoBlue, 0.10f), &pal.cardBorder);
+        text(kTimeSources[g->settings.timeSourceIndex].label,
+            D2D1::RectF(g->rectTimeSourceButton.left + 14, g->rectTimeSourceButton.top,
+                g->rectTimeSourceButton.right - 24, g->rectTimeSourceButton.bottom),
+            g->fmtSmall, pal.textSecondary);
+        text(L"", D2D1::RectF(g->rectTimeSourceButton.right - 26, g->rectTimeSourceButton.top,
+                g->rectTimeSourceButton.right - 4, g->rectTimeSourceButton.bottom),
+            g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         g->rectFullscreenBtn = D2D1::RectF(0, 0, 0, 0);
         g->rectThemeToggle = D2D1::RectF(0, 0, 0, 0);
         g->scheduleButtons.clear();
+        g->rectTimeSourceButton = D2D1::RectF(0, 0, 0, 0);
+        g->timeSourceDropdownOpen = false;
     }
 
     // Left column: clock. Right column: today's period timetable. Split is
@@ -463,14 +528,13 @@ void drawFrame(HWND hwnd) {
     }
 
     const ExamSchedule* active = g->scheduleStore.active();
-    std::wstring examLabel = active ? (active->name + (active->grade.empty() ? L"" : L" · " + active->grade)) : L"시험 일정 없음";
 
     // ---- Left: clock ----
     roundedRect(leftCard, 16, pal.surface, &pal.cardBorder);
-    text(examLabel, D2D1::RectF(leftCard.left + 32, leftCard.top + 24, leftCard.right - 220, leftCard.top + 56),
-        g->fmtBody, hex(kHyoBlue));
-    text(g->timeSync.isSynced() ? L"● 네이버 시간 동기화됨" : L"● 로컬 시간 (동기화 대기중)",
-        D2D1::RectF(leftCard.right - 260, leftCard.top + 24, leftCard.right - 32, leftCard.top + 48),
+    std::wstring syncLabel = std::wstring(kTimeSources[g->settings.timeSourceIndex].label) +
+        (g->timeSync.isSynced() ? L" 시간 동기화됨" : L" 동기화 대기중 (로컬 시간)");
+    text(L"● " + syncLabel,
+        D2D1::RectF(leftCard.left + 24, leftCard.top + 24, leftCard.right - 24, leftCard.top + 48),
         g->fmtSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     // Date/weekday on top, big clock below it.
@@ -480,13 +544,10 @@ void drawFrame(HWND hwnd) {
     text(formatClock(st), D2D1::RectF(leftCard.left, clockCenterY - 90, leftCard.right, clockCenterY + 90),
         g->fmtClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
-    // ---- Right: 교시 및 시험 시간 ----
+    // ---- Right: timetable ----
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
     float rx = rightCard.left + 24;
     float ry = rightCard.top + 20;
-
-    text(L"교시별 시험 시간", D2D1::RectF(rx, ry, rightCard.right - 24, ry + 30), g->fmtHeading, pal.textPrimary);
-    ry += 50;
 
     ScheduleStatus status{};
     if (active) {
@@ -594,13 +655,14 @@ void drawFrame(HWND hwnd) {
     // Footer / about (verbatim brand format) — windowed/admin view only; the
     // fullscreen student display stays clean with no small print.
     if (!g->fullscreen) {
-        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.";
-        text(footer, D2D1::RectF(size.width - pad - 420, size.height - pad - 24, size.width - pad, size.height - pad),
+        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.  ·  hyot.dev";
+        text(footer, D2D1::RectF(size.width - pad - 480, size.height - pad - 24, size.width - pad, size.height - pad),
             g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
     if (g->editingNotices) drawNoticeEditor(size);
+    if (g->timeSourceDropdownOpen) drawTimeSourceDropdown();
 
     HRESULT hr = g->renderTarget->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) discardDeviceResources();
@@ -627,6 +689,7 @@ void toggleFullscreen(HWND hwnd) {
         g->editingPeriodIndex = -1;
         g->editingNotices = false;
         g->draggingSplit = false;
+        g->timeSourceDropdownOpen = false;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g->prevPlacement);
@@ -832,6 +895,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (g->editingNotices) {
             if (ptInRect(pt, g->rectNoticeSave)) saveNoticeEditor();
             else if (ptInRect(pt, g->rectNoticeCancel)) g->editingNotices = false;
+        } else if (g->timeSourceDropdownOpen) {
+            for (int i = 0; i < kTimeSourceCount; i++) {
+                if (ptInRect(pt, g->timeSourceOptionRects[i])) {
+                    g->settings.timeSourceIndex = i;
+                    g->settings.save();
+                    g->timeSync.setHost(kTimeSources[i].host);
+                    break;
+                }
+            }
+            g->timeSourceDropdownOpen = false;
+        } else if (ptInRect(pt, g->rectTimeSourceButton)) {
+            g->timeSourceDropdownOpen = true;
         } else if (ptInRect(pt, g->rectFullscreenBtn)) {
             toggleFullscreen(hwnd);
         } else if (ptInRect(pt, g->rectThemeToggle)) {
@@ -902,6 +977,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
+
+        if (g->timeSourceDropdownOpen) {
+            int newHover = -1;
+            for (int i = 0; i < kTimeSourceCount; i++) {
+                if (ptInRect(pt, g->timeSourceOptionRects[i])) { newHover = i; break; }
+            }
+            if (newHover != g->hoveredTimeSourceOption) {
+                g->hoveredTimeSourceOption = newHover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
         return 0;
     }
     case WM_SETCURSOR: {
@@ -945,6 +1031,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     g->scheduleStore.loadFromFile(g->dataPath);
     if (!g->settings.activeScheduleId.empty()) g->scheduleStore.setActive(g->settings.activeScheduleId);
 
+    if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
+    g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);
     g->timeSync.start();
 
     createDeviceIndependentResources();

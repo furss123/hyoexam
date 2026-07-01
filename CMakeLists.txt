@@ -25,7 +25,7 @@ target_include_directories(HyoExam PRIVATE src)
 target_link_libraries(HyoExam PRIVATE
   d2d1
   dwrite
-  winhttp
+  ws2_32
   windowscodecs
   shlwapi
   comctl32

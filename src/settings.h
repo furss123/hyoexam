@@ -12,6 +12,7 @@ struct Settings {
     Theme theme = Theme::Auto; // default: follow the Windows light/dark setting
     float fontScale = 1.0f;       // 0.8..1.5
     float splitRatio = 0.70f;     // left (clock) panel share of the content width
+    int timeSourceIndex = 0;      // index into kTimeSources (main.cpp)
     std::wstring activeScheduleId;
 
     static std::wstring settingsPath();

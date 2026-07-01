@@ -48,6 +48,7 @@ bool Settings::load() {
     theme = themeStr == "light" ? Theme::Light : themeStr == "dark" ? Theme::Dark : Theme::Auto;
     fontScale = (float)root["fontScale"].asNumber(1.0);
     splitRatio = (float)root["splitRatio"].asNumber(0.70);
+    timeSourceIndex = (int)root["timeSourceIndex"].asNumber(0);
     activeScheduleId = utf8ToWide(root["activeScheduleId"].asString());
     return true;
 }
@@ -58,6 +59,7 @@ bool Settings::save() const {
     root.set("theme", Value::makeString(theme == Theme::Light ? "light" : theme == Theme::Auto ? "auto" : "dark"));
     root.set("fontScale", Value::makeNumber(fontScale));
     root.set("splitRatio", Value::makeNumber(splitRatio));
+    root.set("timeSourceIndex", Value::makeNumber(timeSourceIndex));
     root.set("activeScheduleId", Value::makeString(wideToUtf8(activeScheduleId)));
 
     std::ofstream f(settingsPath(), std::ios::binary | std::ios::trunc);
