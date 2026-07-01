@@ -133,7 +133,7 @@ void createDeviceIndependentResources() {
 
     // Pretendard for UI text, JetBrains Mono for the clock/version (falls back to a
     // system font automatically via DirectWrite's font-fallback if not installed).
-    g->fmtClock = makeFormat(L"JetBrains Mono", 96.0f, DWRITE_FONT_WEIGHT_BOLD);
+    g->fmtClock = makeFormat(L"JetBrains Mono", 150.0f, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtDate = makeFormat(L"Pretendard", 28.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     g->fmtHeading = makeFormat(L"Pretendard", 22.0f, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtBody = makeFormat(L"Pretendard", 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
@@ -283,77 +283,89 @@ void drawFrame(HWND hwnd) {
     int nowMinutes = st.wHour * 60 + st.wMinute;
 
     float pad = 48;
+    float gap = 24;
+    float noticeHeight = 56;
+    float footerHeight = 40;
 
-    // Header card: clock + date + sync indicator.
-    D2D1_RECT_F headerCard = D2D1::RectF(pad, pad, size.width - pad, pad + 170);
-    roundedRect(headerCard, 16, pal.surface, &pal.cardBorder);
-    text(formatClock(st), D2D1::RectF(headerCard.left + 32, headerCard.top + 20, headerCard.right - 32, headerCard.top + 140),
-        g->fmtClock, hex(kHyoBlue));
-    text(formatDate(st), D2D1::RectF(headerCard.left + 32, headerCard.top + 130, headerCard.right - 260, headerCard.bottom - 12),
-        g->fmtDate, pal.textSecondary);
+    // Content area = everything above the bottom notices/footer strip.
+    D2D1_RECT_F content = D2D1::RectF(pad, pad, size.width - pad, size.height - pad - noticeHeight - footerHeight);
+
+    // Left column (70%): clock. Right column (30%): today's period timetable.
+    float totalWidth = content.right - content.left;
+    float leftWidth = totalWidth * 0.70f - gap / 2;
+    D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
+    D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
 
     const ExamSchedule* active = g->scheduleStore.active();
     std::wstring examLabel = active ? (active->name + (active->grade.empty() ? L"" : L" · " + active->grade)) : L"시험 일정 없음";
-    text(examLabel, D2D1::RectF(headerCard.left + 32, headerCard.top + 20, headerCard.right - 140, headerCard.top + 56),
-        g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_LEADING);
 
+    // ---- Left: clock ----
+    roundedRect(leftCard, 16, pal.surface, &pal.cardBorder);
+    text(examLabel, D2D1::RectF(leftCard.left + 32, leftCard.top + 24, leftCard.right - 220, leftCard.top + 56),
+        g->fmtBody, hex(kHyoBlue));
     text(g->timeSync.isSynced() ? L"● 네이버 시간 동기화됨" : L"● 로컬 시간 (동기화 대기중)",
-        D2D1::RectF(headerCard.right - 260, headerCard.top + 20, headerCard.right - 32, headerCard.top + 44),
+        D2D1::RectF(leftCard.right - 260, leftCard.top + 24, leftCard.right - 32, leftCard.top + 48),
         g->fmtSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-    // Gear button.
-    g->rectGear = D2D1::RectF(headerCard.right - 56, headerCard.bottom - 56, headerCard.right - 16, headerCard.bottom - 16);
+    float clockCenterY = leftCard.top + (leftCard.bottom - leftCard.top) / 2.0f;
+    text(formatClock(st), D2D1::RectF(leftCard.left, clockCenterY - 110, leftCard.right, clockCenterY + 70),
+        g->fmtClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(formatDate(st), D2D1::RectF(leftCard.left, clockCenterY + 78, leftCard.right, clockCenterY + 120),
+        g->fmtDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // ---- Right: 교시 및 시험 시간 ----
+    roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
+    float rx = rightCard.left + 24;
+    float ry = rightCard.top + 20;
+    text(L"교시별 시험 시간", D2D1::RectF(rx, ry, rightCard.right - 60, ry + 30), g->fmtHeading, pal.textPrimary);
+
+    g->rectGear = D2D1::RectF(rightCard.right - 52, ry - 4, rightCard.right - 16, ry + 32);
     roundedRect(g->rectGear, 10, hex(kHyoBlue, 0.12f));
     text(L"⚙", g->rectGear, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+    ry += 50;
 
+    ScheduleStatus status{};
     if (active) {
-        ScheduleStatus status = evaluate(*active, nowMinutes);
+        status = evaluate(*active, nowMinutes);
 
-        float bodyTop = headerCard.bottom + 24;
         if (status.inBreak) {
-            D2D1_RECT_F banner = D2D1::RectF(pad, bodyTop, size.width - pad, bodyTop + 90);
-            roundedRect(banner, 16, hex(kOrange, 0.16f), nullptr);
-            std::wstring line = status.currentBreak->start.format() + L" ~ " + status.currentBreak->end.format() +
-                L"  " + status.currentBreak->note;
-            text(line, D2D1::RectF(banner.left + 28, banner.top, banner.right - 28, banner.bottom),
-                g->fmtHeading, hex(kOrange), DWRITE_TEXT_ALIGNMENT_LEADING);
-            bodyTop = banner.bottom + 24;
+            D2D1_RECT_F banner = D2D1::RectF(rx, ry, rightCard.right - 24, ry + 64);
+            roundedRect(banner, 10, hex(kOrange, 0.16f));
+            text(status.currentBreak->start.format() + L" ~ " + status.currentBreak->end.format(),
+                D2D1::RectF(banner.left + 14, banner.top + 6, banner.right - 14, banner.top + 28),
+                g->fmtSmall, hex(kOrange));
+            text(status.currentBreak->note, D2D1::RectF(banner.left + 14, banner.top + 28, banner.right - 14, banner.bottom - 6),
+                g->fmtSmall, hex(kOrange));
+            ry = banner.bottom + 12;
         }
 
-        // Timetable card.
-        D2D1_RECT_F table = D2D1::RectF(pad, bodyTop, size.width - pad, size.height - pad - 60);
-        roundedRect(table, 16, pal.surface, &pal.cardBorder);
-
-        float rowH = (table.bottom - table.top - 24) / (float)std::max<size_t>(1, active->periods.size());
-        rowH = std::min(rowH, 76.0f);
-        float ry = table.top + 12;
+        float rowH = std::min(84.0f, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, active->periods.size()));
         for (auto& p : active->periods) {
             bool isCurrent = status.currentPeriod == &p;
-            D2D1_RECT_F row = D2D1::RectF(table.left + 16, ry, table.right - 16, ry + rowH - 8);
+            D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
             if (isCurrent) roundedRect(row, 10, hex(kHyoBlue, 0.16f));
 
-            text(p.label, D2D1::RectF(row.left + 16, row.top, row.left + 130, row.bottom),
-                g->fmtBody, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
-            text(p.subject, D2D1::RectF(row.left + 140, row.top, row.left + 340, row.bottom),
-                g->fmtHeading, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
-            std::wstring timeStr = p.start.format() + L" ~ " + p.end.format();
-            text(timeStr, D2D1::RectF(row.left + 340, row.top, row.right - 140, row.bottom),
-                g->fmtBody, pal.textSecondary);
-            std::wstring durStr = std::to_wstring(p.durationMinutes) + L"분";
-            text(durStr, D2D1::RectF(row.right - 140, row.top, row.right - 16, row.bottom),
-                g->fmtBody, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, row.top + 6, row.right - 14, row.top + 34),
+                g->fmtBody, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
+            text(p.start.format() + L" ~ " + p.end.format() + L"  (" + std::to_wstring(p.durationMinutes) + L"분)",
+                D2D1::RectF(row.left + 14, row.top + 36, row.right - 14, row.top + rowH - 14),
+                g->fmtSmall, pal.textSecondary);
 
             ry += rowH;
         }
+    } else {
+        text(L"시험 일정 없음", D2D1::RectF(rx, ry, rightCard.right - 24, ry + 30), g->fmtBody, pal.textTertiary);
+    }
 
-        // Bottom fixed notices.
-        float noticeY = size.height - pad - 48;
+    // ---- Bottom fixed notices ----
+    if (active && !active->notices.empty()) {
         std::wstring notices;
         for (size_t i = 0; i < active->notices.size(); i++) {
             notices += active->notices[i];
             if (i + 1 < active->notices.size()) notices += L"   ·   ";
         }
-        text(notices, D2D1::RectF(pad, noticeY, size.width - pad - 260, noticeY + 36), g->fmtSmall, pal.textTertiary);
+        float noticeY = content.bottom + 14;
+        text(notices, D2D1::RectF(pad, noticeY, size.width - pad - 260, noticeY + noticeHeight), g->fmtSmall, pal.textTertiary);
     }
 
     // Footer / about (verbatim brand format).
@@ -450,6 +462,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_KEYDOWN:
         if (wParam == VK_F11) toggleFullscreen(hwnd);
         else if (wParam == VK_ESCAPE && g->settingsOpen) { g->settingsOpen = false; g->settings.save(); InvalidateRect(hwnd, nullptr, FALSE); }
+        else if (wParam == VK_ESCAPE && g->fullscreen) { toggleFullscreen(hwnd); }
         else if (wParam == VK_F2) { g->settingsOpen = !g->settingsOpen; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     case WM_DESTROY:
@@ -488,6 +501,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    toggleFullscreen(hwnd); // TV signage display: launch fullscreen by default (Esc/F11 to leave).
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
