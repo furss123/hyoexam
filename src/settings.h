@@ -12,7 +12,6 @@ struct Settings {
     Theme theme = Theme::Dark;
     float fontScale = 1.0f;       // 0.8..1.5
     float splitRatio = 0.70f;     // left (clock) panel share of the content width
-    std::wstring fontFamily = L"Pretendard";
     std::wstring activeScheduleId;
 
     static std::wstring settingsPath();

@@ -29,16 +29,17 @@ constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
 
-// Native child control IDs (Edit/ComboBox) used for text entry — Direct2D has no
+// Native child control IDs (Edit) used for text entry — Direct2D has no
 // text-input widgets of its own, so real typing/Korean IME goes through these.
 constexpr int kIdEditLabel = 101;
 constexpr int kIdEditSubject = 102;
 constexpr int kIdEditStart = 103;
 constexpr int kIdEditEnd = 104;
 constexpr int kIdEditNotices = 105;
-constexpr int kIdComboFont = 106;
 
-const wchar_t* kFontChoices[] = { L"Pretendard", L"맑은 고딕", L"나눔고딕", L"굴림", L"돋움" };
+// Malgun Gothic ships with every Windows 10/11 install (it's the OS's own
+// Korean UI font) — no bundling, no missing-font fallback surprises.
+constexpr wchar_t kUiFontFamily[] = L"맑은 고딕";
 
 // ---- Brand palette (HyoT-brand-kit.md — do not introduce new hues) ----
 struct Palette {
@@ -102,17 +103,14 @@ struct AppState {
 
     bool settingsOpen = false;
     bool fullscreen = false;
-    bool editMode = false;
     WINDOWPLACEMENT prevPlacement{ sizeof(WINDOWPLACEMENT) };
 
     // Hit-test rects for the settings modal, recomputed each frame it's drawn.
     D2D1_RECT_F rectClose{};
     D2D1_RECT_F rectGear{};
-    D2D1_RECT_F rectEditMode{};
     D2D1_RECT_F rectFullscreenBtn{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
     D2D1_RECT_F rectThemeDark{}, rectThemeLight{}, rectThemeAuto{};
-    D2D1_RECT_F rectFontCombo{};
 
     // Layout editing: draggable divider between the clock and timetable panels.
     D2D1_RECT_F rectSplitHandle{};
@@ -134,7 +132,7 @@ struct AppState {
     D2D1_RECT_F rectNoticesField{};
 
     HWND hEditLabel = nullptr, hEditSubject = nullptr, hEditStart = nullptr, hEditEnd = nullptr;
-    HWND hEditNotices = nullptr, hComboFont = nullptr;
+    HWND hEditNotices = nullptr;
     HFONT hUiFont = nullptr;
 };
 
@@ -164,10 +162,10 @@ IDWriteTextFormat* makeFormat(const wchar_t* family, float size, DWRITE_FONT_WEI
     return fmt;
 }
 
-// (Re)builds every UI text format from the user's chosen display font. Clock and
-// UI text follow the user's pick (brand kit: "allow a user-selectable display
-// font"); the footer version line stays JetBrains Mono and icons stay Segoe MDL2
-// Assets, per brand rule / for guaranteed glyph coverage respectively.
+// Builds every UI text format from the fixed display font (kUiFontFamily —
+// Malgun Gothic, always present on Windows 10/11). The footer version line
+// stays JetBrains Mono and icons stay Segoe MDL2 Assets, per brand rule / for
+// guaranteed glyph coverage respectively.
 void buildFonts() {
     if (g->fmtClock) g->fmtClock->Release();
     if (g->fmtDate) g->fmtDate->Release();
@@ -175,7 +173,7 @@ void buildFonts() {
     if (g->fmtBody) g->fmtBody->Release();
     if (g->fmtSmall) g->fmtSmall->Release();
 
-    const wchar_t* family = g->settings.fontFamily.c_str();
+    const wchar_t* family = kUiFontFamily;
     g->fmtClock = makeFormat(family, 150.0f, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtDate = makeFormat(family, 28.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     g->fmtHeading = makeFormat(family, 22.0f, DWRITE_FONT_WEIGHT_BOLD);
@@ -251,7 +249,7 @@ void drawSettingsModal(D2D1_SIZE_F size) {
     Palette pal = currentPalette();
     g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
 
-    float w = 640, h = 500;
+    float w = 640, h = 420;
     D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
     roundedRect(card, 16, pal.surface, &pal.cardBorder);
 
@@ -296,12 +294,6 @@ void drawSettingsModal(D2D1_SIZE_F size) {
     g->rectThemeDark = themeBtn(x, L"다크", Theme::Dark);
     g->rectThemeLight = themeBtn(x + 132, L"라이트", Theme::Light);
     g->rectThemeAuto = themeBtn(x + 264, L"자동", Theme::Auto);
-    y += 40 + 28;
-
-    // Section: font — native ComboBox positioned/shown by syncNativeControls().
-    text(L"폰트", D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtBody, pal.textSecondary);
-    y += 34;
-    g->rectFontCombo = D2D1::RectF(x, y, x + 240, y + 32);
 
     text(L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.",
         D2D1::RectF(x, card.bottom - pad - 20, card.right - pad, card.bottom - pad), g->fmtVersion, pal.textTertiary);
@@ -390,17 +382,10 @@ void drawNoticeEditor(D2D1_SIZE_F size) {
     text(L"저장", g->rectNoticeSave, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
-// Shows/hides/positions the native Edit/ComboBox child controls to match whatever
+// Shows/hides/positions the native Edit child controls to match whatever
 // Direct2D popup is currently open. Content (SetWindowText) is set once, at the
 // moment a popup opens — this only handles visibility and placement each tick.
 void syncNativeControls() {
-    bool showFont = g->settingsOpen;
-    ShowWindow(g->hComboFont, showFont ? SW_SHOWNA : SW_HIDE);
-    if (showFont) {
-        SetWindowPos(g->hComboFont, nullptr, (int)g->rectFontCombo.left, (int)g->rectFontCombo.top,
-            (int)(g->rectFontCombo.right - g->rectFontCombo.left), 200, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-
     bool showPeriodFields = g->editingPeriodIndex != -1;
     int periodShow = showPeriodFields ? SW_SHOWNA : SW_HIDE;
     ShowWindow(g->hEditLabel, periodShow);
@@ -451,13 +436,36 @@ void drawFrame(HWND hwnd) {
     float pad = 48;
     float gap = 24;
     float noticeHeight = 56;
-    float footerHeight = 40;
+    // Fullscreen is the clean student-facing display: no admin toolbar, no footer.
+    float footerHeight = g->fullscreen ? 0.0f : 40.0f;
+    float topBarHeight = g->fullscreen ? 0.0f : 52.0f;
 
-    // Content area = everything above the bottom notices/footer strip.
-    D2D1_RECT_F content = D2D1::RectF(pad, pad, size.width - pad, size.height - pad - noticeHeight - footerHeight);
+    // Content area = everything below the admin toolbar and above the bottom
+    // notices/footer strip.
+    D2D1_RECT_F content = D2D1::RectF(pad, pad + topBarHeight, size.width - pad, size.height - pad - noticeHeight - footerHeight);
+
+    // Admin toolbar (settings, fullscreen) sits above both cards — global app
+    // controls, not tied to either panel. Hidden entirely in fullscreen.
+    if (!g->fullscreen) {
+        float iconSize = 36, iconGap = 8;
+        float iconsRight = size.width - pad;
+        float iconTop = pad;
+
+        // Order swapped from the old in-card toolbar: settings first, fullscreen last.
+        g->rectGear = D2D1::RectF(iconsRight - iconSize * 2 - iconGap, iconTop, iconsRight - iconSize - iconGap, iconTop + iconSize);
+        roundedRect(g->rectGear, 10, hex(kHyoBlue, 0.12f));
+        text(L"", g->rectGear, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        g->rectFullscreenBtn = D2D1::RectF(iconsRight - iconSize, iconTop, iconsRight, iconTop + iconSize);
+        roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
+        text(g->fullscreen ? L"" : L"", g->rectFullscreenBtn, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        g->rectGear = D2D1::RectF(0, 0, 0, 0);
+        g->rectFullscreenBtn = D2D1::RectF(0, 0, 0, 0);
+    }
 
     // Left column: clock. Right column: today's period timetable. Split is
-    // user-adjustable in edit mode (settings.splitRatio), default 70/30.
+    // user-adjustable (drag handle, windowed only) via settings.splitRatio.
     float totalWidth = content.right - content.left;
     g->contentLeft = content.left;
     g->contentWidth = totalWidth;
@@ -465,7 +473,7 @@ void drawFrame(HWND hwnd) {
     D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
     D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
 
-    if (g->editMode) {
+    if (!g->fullscreen) {
         g->rectSplitHandle = D2D1::RectF(leftCard.right + gap / 2 - 6, content.top, leftCard.right + gap / 2 + 6, content.bottom);
         roundedRect(g->rectSplitHandle, 6, hex(kHyoBlue, g->draggingSplit ? 0.55f : 0.30f));
     } else {
@@ -495,34 +503,7 @@ void drawFrame(HWND hwnd) {
     float rx = rightCard.left + 24;
     float ry = rightCard.top + 20;
 
-    // Top-right icon row: edit mode / fullscreen / settings. Hidden in fullscreen -
-    // that is the student-facing display and should not show admin controls at all;
-    // exiting fullscreen (Esc/F11) brings the toolbar back for editing.
-    if (!g->fullscreen) {
-        float iconSize = 36, iconGap = 8;
-        float iconsRight = rightCard.right - 24;
-        float iconsLeft = iconsRight - (iconSize * 3 + iconGap * 2);
-        float iconTop = ry - 6;
-
-        text(L"교시별 시험 시간", D2D1::RectF(rx, ry, iconsLeft - 12, ry + 30), g->fmtHeading, pal.textPrimary);
-
-        g->rectEditMode = D2D1::RectF(iconsLeft, iconTop, iconsLeft + iconSize, iconTop + iconSize);
-        roundedRect(g->rectEditMode, 10, g->editMode ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.12f));
-        text(L"", g->rectEditMode, g->fmtIcon, g->editMode ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        g->rectFullscreenBtn = D2D1::RectF(iconsLeft + iconSize + iconGap, iconTop, iconsLeft + iconSize * 2 + iconGap, iconTop + iconSize);
-        roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
-        text(g->fullscreen ? L"" : L"", g->rectFullscreenBtn, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        g->rectGear = D2D1::RectF(iconsLeft + (iconSize + iconGap) * 2, iconTop, iconsRight, iconTop + iconSize);
-        roundedRect(g->rectGear, 10, hex(kHyoBlue, 0.12f));
-        text(L"", g->rectGear, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-    } else {
-        text(L"교시별 시험 시간", D2D1::RectF(rx, ry, rightCard.right - 24, ry + 30), g->fmtHeading, pal.textPrimary);
-        g->rectEditMode = D2D1::RectF(0, 0, 0, 0);
-        g->rectFullscreenBtn = D2D1::RectF(0, 0, 0, 0);
-        g->rectGear = D2D1::RectF(0, 0, 0, 0);
-    }
+    text(L"교시별 시험 시간", D2D1::RectF(rx, ry, rightCard.right - 24, ry + 30), g->fmtHeading, pal.textPrimary);
     ry += 50;
 
     ScheduleStatus status{};
@@ -540,7 +521,7 @@ void drawFrame(HWND hwnd) {
             ry = banner.bottom + 12;
         }
 
-        size_t slotCount = active->periods.size() + (g->editMode ? 1 : 0);
+        size_t slotCount = active->periods.size() + (!g->fullscreen ? 1 : 0);
         float rowH = std::min(84.0f, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, slotCount));
         g->periodRowRects.clear();
         g->periodDeleteRects.clear();
@@ -550,14 +531,14 @@ void drawFrame(HWND hwnd) {
             D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
             if (isCurrent) roundedRect(row, 10, hex(kHyoBlue, 0.16f));
 
-            float textRight = g->editMode ? row.right - 40 : row.right - 14;
+            float textRight = !g->fullscreen ? row.right - 40 : row.right - 14;
             text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, row.top + 6, textRight, row.top + 34),
                 g->fmtBody, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
             text(p.start.format() + L" ~ " + p.end.format() + L"  (" + std::to_wstring(p.durationMinutes) + L"분)",
                 D2D1::RectF(row.left + 14, row.top + 36, textRight, row.top + rowH - 14),
                 g->fmtSmall, pal.textSecondary);
 
-            if (g->editMode) {
+            if (!g->fullscreen) {
                 float rowCenterY = (row.top + row.bottom) / 2.0f;
                 D2D1_RECT_F delBtn = D2D1::RectF(row.right - 32, rowCenterY - 13, row.right - 6, rowCenterY + 13);
                 roundedRect(delBtn, 8, hex(kErrorLight, 0.14f));
@@ -571,7 +552,7 @@ void drawFrame(HWND hwnd) {
             ry += rowH;
         }
 
-        if (g->editMode) {
+        if (!g->fullscreen) {
             g->rectAddPeriod = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
             roundedRect(g->rectAddPeriod, 10, hex(kHyoBlue, 0.10f), &pal.cardBorder);
             text(L"+  교시 추가", g->rectAddPeriod, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -585,7 +566,7 @@ void drawFrame(HWND hwnd) {
     // ---- Bottom fixed notices ----
     float noticeY = content.bottom + 14;
     float noticeTextLeft = pad;
-    if (g->editMode && active) {
+    if (!g->fullscreen && active) {
         g->rectNoticesEditIcon = D2D1::RectF(pad, noticeY, pad + 28, noticeY + 28);
         roundedRect(g->rectNoticesEditIcon, 8, hex(kHyoBlue, 0.14f));
         text(L"", g->rectNoticesEditIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -602,10 +583,13 @@ void drawFrame(HWND hwnd) {
         text(notices, D2D1::RectF(noticeTextLeft, noticeY, size.width - pad - 260, noticeY + noticeHeight), g->fmtSmall, pal.textTertiary);
     }
 
-    // Footer / about (verbatim brand format).
-    std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.";
-    text(footer, D2D1::RectF(size.width - pad - 420, size.height - pad - 24, size.width - pad, size.height - pad),
-        g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    // Footer / about (verbatim brand format) — windowed/admin view only; the
+    // fullscreen student display stays clean with no small print.
+    if (!g->fullscreen) {
+        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.";
+        text(footer, D2D1::RectF(size.width - pad - 420, size.height - pad - 24, size.width - pad, size.height - pad),
+            g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
 
     if (g->settingsOpen) drawSettingsModal(size);
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
@@ -633,7 +617,6 @@ void toggleFullscreen(HWND hwnd) {
         }
         g->fullscreen = true;
         // Fullscreen is the student-facing display — always land on a clean view.
-        g->editMode = false;
         g->settingsOpen = false;
         g->editingPeriodIndex = -1;
         g->editingNotices = false;
@@ -777,17 +760,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g->hEditEnd = makeEdit(kIdEditEnd, ES_AUTOHSCROLL);
         g->hEditNotices = makeEdit(kIdEditNotices, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL);
 
-        g->hComboFont = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0,
-            hwnd, (HMENU)(INT_PTR)kIdComboFont, hInst, nullptr);
-        SendMessage(g->hComboFont, WM_SETFONT, (WPARAM)g->hUiFont, TRUE);
-        int selectIdx = 0;
-        for (int i = 0; i < (int)(sizeof(kFontChoices) / sizeof(kFontChoices[0])); i++) {
-            SendMessageW(g->hComboFont, CB_ADDSTRING, 0, (LPARAM)kFontChoices[i]);
-            if (g->settings.fontFamily == kFontChoices[i]) selectIdx = i;
-        }
-        SendMessage(g->hComboFont, CB_SETCURSEL, selectIdx, 0);
-
         return 0;
     }
     case WM_TIMER:
@@ -836,15 +808,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g->settingsOpen = true;
         } else if (ptInRect(pt, g->rectFullscreenBtn)) {
             toggleFullscreen(hwnd);
-        } else if (ptInRect(pt, g->rectEditMode)) {
-            g->editMode = !g->editMode;
-        } else if (g->editMode && ptInRect(pt, g->rectSplitHandle)) {
+        } else if (!g->fullscreen && ptInRect(pt, g->rectSplitHandle)) {
             g->draggingSplit = true;
-        } else if (g->editMode && ptInRect(pt, g->rectAddPeriod)) {
+        } else if (!g->fullscreen && ptInRect(pt, g->rectAddPeriod)) {
             openPeriodEditor(-2);
-        } else if (g->editMode && ptInRect(pt, g->rectNoticesEditIcon)) {
+        } else if (!g->fullscreen && ptInRect(pt, g->rectNoticesEditIcon)) {
             openNoticeEditor();
-        } else if (g->editMode) {
+        } else if (!g->fullscreen) {
             bool handled = false;
             for (size_t i = 0; i < g->periodDeleteRects.size() && !handled; i++) {
                 if (ptInRect(pt, g->periodDeleteRects[i])) { deletePeriodAt((int)i); handled = true; }
@@ -867,17 +837,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_LBUTTONUP:
         if (g->draggingSplit) { g->draggingSplit = false; g->settings.save(); }
-        return 0;
-    case WM_COMMAND:
-        if (LOWORD(wParam) == kIdComboFont && HIWORD(wParam) == CBN_SELCHANGE) {
-            int idx = (int)SendMessage(g->hComboFont, CB_GETCURSEL, 0, 0);
-            if (idx >= 0 && idx < (int)(sizeof(kFontChoices) / sizeof(kFontChoices[0]))) {
-                g->settings.fontFamily = kFontChoices[idx];
-                g->settings.save();
-                buildFonts();
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11) toggleFullscreen(hwnd);
