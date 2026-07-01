@@ -64,10 +64,16 @@ constexpr int kTimeSourceCount = (int)(sizeof(kTimeSources) / sizeof(kTimeSource
 struct Palette {
     D2D1_COLOR_F base, surface, cardBorder;
     D2D1_COLOR_F textPrimary, textSecondary, textTertiary;
+    D2D1_COLOR_F error; // theme-tuned delete/error accent (brighter on dark bg for contrast)
 };
 
 D2D1_COLOR_F hex(UINT32 rgb, float a = 1.0f) {
     return D2D1::ColorF(rgb, a);
+}
+
+// Same color, different alpha — for tinting a palette color's fill vs. its solid text/icon use.
+D2D1_COLOR_F withAlpha(D2D1_COLOR_F c, float a) {
+    return D2D1::ColorF(c.r, c.g, c.b, a);
 }
 
 constexpr UINT32 kHyoBlue = 0x4A9FE0;
@@ -87,6 +93,7 @@ Palette darkPalette() {
     p.textPrimary = hex(0xEEF2FF);
     p.textSecondary = hex(0x8896AA);
     p.textTertiary = hex(0x4A5870);
+    p.error = hex(kErrorDark);
     return p;
 }
 
@@ -98,6 +105,7 @@ Palette lightPalette() {
     p.textPrimary = hex(0x12151C);
     p.textSecondary = hex(0x45526B);
     p.textTertiary = hex(0x8896AA);
+    p.error = hex(kErrorLight);
     return p;
 }
 
@@ -123,6 +131,16 @@ struct AppState {
     IDWriteTextFormat* fmtSmall = nullptr;
     IDWriteTextFormat* fmtVersion = nullptr;
     IDWriteTextFormat* fmtIcon = nullptr;
+
+    // Fullscreen (TV/projector) variants of clock/date/body/small — sized off the
+    // actual monitor resolution so the student-facing display fills the frame
+    // instead of reusing windowed-desktop-sized text on a huge canvas.
+    IDWriteTextFormat* fmtClockFS = nullptr;
+    IDWriteTextFormat* fmtDateFS = nullptr;
+    IDWriteTextFormat* fmtBodyFS = nullptr;
+    IDWriteTextFormat* fmtSmallFS = nullptr;
+    float fsFontsBuiltForHeight = -1.0f;
+    float fsClockCorrectedForWidth = -1.0f;
 
     Settings settings;
     ScheduleStore scheduleStore;
@@ -260,6 +278,36 @@ void buildFonts() {
     g->fmtHeading->SetTrimming(&trimming, nullptr);
 }
 
+// Fullscreen (TV/projector) text sizes, scaled off actual window height instead
+// of the fixed windowed-desktop sizes in buildFonts(). Rebuilt only when the
+// fullscreen canvas height actually changes (monitor swap / DPI change), not
+// every frame, since CreateTextFormat is not free.
+void buildFullscreenFonts(float height) {
+    if (g->fmtClockFS) g->fmtClockFS->Release();
+    if (g->fmtDateFS) g->fmtDateFS->Release();
+    if (g->fmtBodyFS) g->fmtBodyFS->Release();
+    if (g->fmtSmallFS) g->fmtSmallFS->Release();
+
+    const wchar_t* family = kUiFontFamily;
+    float clockSize = std::clamp(height * 0.34f, 120.0f, 520.0f);
+    float dateSize = std::clamp(height * 0.034f, 26.0f, 64.0f);
+    float bodySize = std::clamp(height * 0.032f, 20.0f, 56.0f);
+    float smallSize = std::clamp(height * 0.024f, 16.0f, 40.0f);
+
+    g->fmtClockFS = makeFormat(family, clockSize, DWRITE_FONT_WEIGHT_BOLD);
+    g->fmtClockFS->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    // The clock is a single "HH:MM:SS" line — never let it wrap. Actual width-fit
+    // is re-checked/corrected against the real card width each frame in drawFrame,
+    // since that's not known yet at this height-only sizing pass.
+    g->fmtClockFS->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    g->fmtDateFS = makeFormat(family, dateSize, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    g->fmtDateFS->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    g->fmtBodyFS = makeFormat(family, bodySize, DWRITE_FONT_WEIGHT_MEDIUM);
+    g->fmtSmallFS = makeFormat(family, smallSize, DWRITE_FONT_WEIGHT_NORMAL);
+    g->fsFontsBuiltForHeight = height;
+    g->fsClockCorrectedForWidth = -1.0f; // force the width-fit re-check in drawFrame against the fresh clock format
+}
+
 void createDeviceIndependentResources() {
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g->d2dFactory);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -365,8 +413,8 @@ void drawPeriodEditor(D2D1_SIZE_F size) {
     float btnY = card.bottom - pad - 40;
     if (!isNew) {
         g->rectPeriodDelete = D2D1::RectF(x, btnY, x + 90, btnY + 40);
-        roundedRect(g->rectPeriodDelete, 10, hex(kErrorLight, 0.14f));
-        text(L"삭제", g->rectPeriodDelete, g->fmtSmall, hex(kErrorLight), DWRITE_TEXT_ALIGNMENT_CENTER);
+        roundedRect(g->rectPeriodDelete, 10, withAlpha(pal.error, 0.14f));
+        text(L"삭제", g->rectPeriodDelete, g->fmtSmall, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         g->rectPeriodDelete = D2D1::RectF(0, 0, 0, 0);
     }
@@ -505,8 +553,8 @@ void drawLoadProfilePopup(D2D1_SIZE_F size) {
 
             D2D1_RECT_F delBtn = D2D1::RectF(row.right - 34, row.top + (row.bottom - row.top - 26) / 2,
                 row.right - 8, row.top + (row.bottom - row.top - 26) / 2 + 26);
-            roundedRect(delBtn, 8, hex(kErrorLight, 0.14f));
-            text(L"", delBtn, g->fmtIcon, hex(kErrorLight), DWRITE_TEXT_ALIGNMENT_CENTER);
+            roundedRect(delBtn, 8, withAlpha(pal.error, 0.14f));
+            text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             g->profileRowRects[i] = row;
             g->profileRowDeleteRects[i] = delBtn;
@@ -574,6 +622,15 @@ void drawFrame(HWND hwnd) {
     D2D1_SIZE_F size = g->renderTarget->GetSize();
     Palette pal = currentPalette();
 
+    // Fullscreen uses its own, monitor-scaled text sizes (see buildFullscreenFonts)
+    // so the student-facing display fills the frame instead of reusing windowed
+    // desktop-sized text. Rebuilt lazily only when the canvas height changes.
+    if (g->fullscreen && g->fsFontsBuiltForHeight != size.height) buildFullscreenFonts(size.height);
+    IDWriteTextFormat* fClock = g->fullscreen ? g->fmtClockFS : g->fmtClock;
+    IDWriteTextFormat* fDate = g->fullscreen ? g->fmtDateFS : g->fmtDate;
+    IDWriteTextFormat* fBody = g->fullscreen ? g->fmtBodyFS : g->fmtBody;
+    IDWriteTextFormat* fSmall = g->fullscreen ? g->fmtSmallFS : g->fmtSmall;
+
     g->renderTarget->BeginDraw();
     g->renderTarget->Clear(pal.base);
 
@@ -590,7 +647,10 @@ void drawFrame(HWND hwnd) {
 
     float pad = 48;
     float gap = 24;
-    float noticeHeight = 56;
+    // Notice strip stays visible in fullscreen (legible-from-across-the-room
+    // reminders), so its height scales with fSmall's fullscreen-sized font
+    // instead of staying fixed at the small windowed value.
+    float noticeHeight = g->fullscreen ? fSmall->GetFontSize() * 2.0f : 56.0f;
     // Fullscreen is the clean student-facing display: no admin toolbar, no footer.
     float footerHeight = g->fullscreen ? 0.0f : 40.0f;
     float topBarHeight = g->fullscreen ? 0.0f : 52.0f;
@@ -602,9 +662,13 @@ void drawFrame(HWND hwnd) {
     // Admin toolbar sits above both cards -- global app controls, not tied to
     // either panel. Hidden entirely in fullscreen (student-facing display).
     if (!g->fullscreen) {
-        float iconSize = 36, iconGap = 8;
+        // Unified 12px spacing grid for the whole toolbar row (icon-to-icon,
+        // tab-to-tab, tab-to-dropdown), and icons/tabs share one vertically
+        // centered baseline within the topBarHeight band instead of both
+        // being pinned to its top edge.
+        float iconSize = 36, iconGap = 12;
         float iconsRight = size.width - pad;
-        float iconTop = pad;
+        float iconTop = pad + (topBarHeight - iconSize) / 2.0f;
 
         // Right side: theme toggle immediately left of fullscreen.
         g->rectFullscreenBtn = D2D1::RectF(iconsRight - iconSize, iconTop, iconsRight, iconTop + iconSize);
@@ -634,11 +698,11 @@ void drawFrame(HWND hwnd) {
             roundedRect(r, 10, isActive ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f), isActive ? nullptr : &pal.cardBorder);
             text(sc.name, r, g->fmtSmall, isActive ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
             g->scheduleButtons.push_back({ r, sc.id });
-            bx += bw + 10;
+            bx += bw + iconGap;
         }
 
         // Time-source dropdown button, right after the exam-type buttons.
-        bx += 6;
+        bx += iconGap;
         float dropdownW = 150;
         g->rectTimeSourceButton = D2D1::RectF(bx, iconTop, bx + dropdownW, iconTop + iconSize);
         roundedRect(g->rectTimeSourceButton, 10, hex(kHyoBlue, 0.10f), &pal.cardBorder);
@@ -666,6 +730,27 @@ void drawFrame(HWND hwnd) {
     D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
     D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
 
+    // The height-only pass in buildFullscreenFonts() can size the clock too wide
+    // for narrower card ratios / aspect ratios (it doesn't know the card width
+    // yet). Re-check against the real left-card width here and shrink if needed
+    // — this is what actually prevents the "HH:MM:SS" line from wrapping/clipping.
+    if (g->fullscreen) {
+        float cardWidth = leftCard.right - leftCard.left;
+        if (g->fsClockCorrectedForWidth != cardWidth) {
+            const float kClockCharCount = 8.0f;      // "HH:MM:SS"
+            const float kClockAdvanceEm = 0.58f;     // approx. digit advance as a fraction of em, Malgun Gothic Bold
+            float widthFitSize = (cardWidth * 0.92f) / (kClockCharCount * kClockAdvanceEm);
+            float appliedSize = std::min(fClock->GetFontSize(), std::clamp(widthFitSize, 60.0f, 520.0f));
+            if (appliedSize != fClock->GetFontSize()) {
+                fClock->Release();
+                fClock = makeFormat(kUiFontFamily, appliedSize, DWRITE_FONT_WEIGHT_BOLD);
+                fClock->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                g->fmtClockFS = fClock;
+            }
+            g->fsClockCorrectedForWidth = cardWidth;
+        }
+    }
+
     if (!g->fullscreen) {
         g->rectSplitHandle = D2D1::RectF(leftCard.right + gap / 2 - 6, content.top, leftCard.right + gap / 2 + 6, content.bottom);
         roundedRect(g->rectSplitHandle, 6, hex(kHyoBlue, g->draggingSplit ? 0.55f : 0.30f));
@@ -677,41 +762,57 @@ void drawFrame(HWND hwnd) {
 
     // ---- Left: clock ----
     roundedRect(leftCard, 16, pal.surface, &pal.cardBorder);
+    float cardPad = g->fullscreen ? 32.0f : 24.0f;
+    float syncLabelH = fSmall->GetFontSize() * 1.6f;
     std::wstring syncLabel = std::wstring(kTimeSources[g->settings.timeSourceIndex].label) +
         (g->timeSync.isSynced() ? L" 시간 동기화됨" : L" 동기화 대기중 (로컬 시간)");
     text(L"● " + syncLabel,
-        D2D1::RectF(leftCard.left + 24, leftCard.top + 24, leftCard.right - 24, leftCard.top + 48),
-        g->fmtSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        D2D1::RectF(leftCard.left + cardPad, leftCard.top + cardPad, leftCard.right - cardPad, leftCard.top + cardPad + syncLabelH),
+        fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-    // Date/weekday on top, big clock below it.
+    // Date/weekday on top, big clock below it — the whole block is centered as
+    // a unit within the card (both vertically and horizontally) using the
+    // actual chosen font sizes, so fullscreen's much larger clock digits stay
+    // visually balanced instead of sitting at windowed-mode offsets.
     float clockCenterY = leftCard.top + (leftCard.bottom - leftCard.top) / 2.0f;
-    text(formatDate(st), D2D1::RectF(leftCard.left, clockCenterY - 148, leftCard.right, clockCenterY - 106),
-        g->fmtDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(formatClock(st), D2D1::RectF(leftCard.left, clockCenterY - 90, leftCard.right, clockCenterY + 90),
-        g->fmtClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+    float dateLineH = fDate->GetFontSize() * 1.3f;
+    float clockLineH = fClock->GetFontSize() * 1.15f;
+    float blockGap = fDate->GetFontSize() * 0.6f;
+    float blockTotalH = dateLineH + blockGap + clockLineH;
+    float blockTop = clockCenterY - blockTotalH / 2.0f;
+    text(formatDate(st), D2D1::RectF(leftCard.left, blockTop, leftCard.right, blockTop + dateLineH),
+        fDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(formatClock(st), D2D1::RectF(leftCard.left, blockTop + dateLineH + blockGap, leftCard.right, blockTop + blockTotalH),
+        fClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // ---- Right: timetable ----
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
-    float rx = rightCard.left + 24;
-    float ry = rightCard.top + 20;
+    float rx = rightCard.left + cardPad;
+    float ry = rightCard.top + cardPad - 4.0f;
+    float bannerH = g->fullscreen ? fSmall->GetFontSize() * 3.6f : 64.0f;
 
     ScheduleStatus status{};
     if (active) {
         status = evaluate(*active, nowMinutes);
 
         if (status.inBreak) {
-            D2D1_RECT_F banner = D2D1::RectF(rx, ry, rightCard.right - 24, ry + 64);
+            D2D1_RECT_F banner = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + bannerH);
             roundedRect(banner, 10, hex(kOrange, 0.16f));
             text(status.currentBreak->start.format() + L" ~ " + status.currentBreak->end.format(),
-                D2D1::RectF(banner.left + 14, banner.top + 6, banner.right - 14, banner.top + 28),
-                g->fmtSmall, hex(kOrange));
-            text(status.currentBreak->note, D2D1::RectF(banner.left + 14, banner.top + 28, banner.right - 14, banner.bottom - 6),
-                g->fmtSmall, hex(kOrange));
+                D2D1::RectF(banner.left + 14, banner.top + 6, banner.right - 14, banner.top + bannerH * 0.45f),
+                fSmall, hex(kOrange));
+            text(status.currentBreak->note, D2D1::RectF(banner.left + 14, banner.top + bannerH * 0.45f, banner.right - 14, banner.bottom - 6),
+                fSmall, hex(kOrange));
             ry = banner.bottom + 12;
         }
 
+        // Windowed mode caps row height so more periods just scroll-fit; fullscreen
+        // instead fills whatever vertical space is available (no cap) so 3-4 periods
+        // on a projector read as large, evenly distributed cards instead of a small
+        // packed list floating in empty space.
         size_t slotCount = active->periods.size() + (!g->fullscreen ? 1 : 0);
-        float rowH = std::min(84.0f, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, slotCount));
+        float rowCap = g->fullscreen ? 100000.0f : 84.0f;
+        float rowH = std::min(rowCap, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, slotCount));
         g->periodListTop = ry;
         g->periodRowHeight = rowH;
 
@@ -749,17 +850,23 @@ void drawFrame(HWND hwnd) {
             }
 
             float textRight = !g->fullscreen ? row.right - 40 : row.right - 14;
-            text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, row.top + 6, textRight, row.top + 34),
-                g->fmtBody, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
+            // Title/time line positions scale off the actual chosen font sizes
+            // (rather than fixed 6/34/36/14px offsets) so fullscreen's larger
+            // fBody/fSmall don't clip or crowd inside the also-larger rowH.
+            float titleTop = row.top + rowH * 0.10f;
+            float titleH = fBody->GetFontSize() * 1.3f;
+            float timeTop = titleTop + titleH + fBody->GetFontSize() * 0.15f;
+            text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, titleTop, textRight, titleTop + titleH),
+                fBody, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
             text(p.start.format() + L" ~ " + p.end.format() + L"  (" + std::to_wstring(p.durationMinutes) + L"분)",
-                D2D1::RectF(row.left + 14, row.top + 36, textRight, row.top + rowH - 14),
-                g->fmtSmall, pal.textSecondary);
+                D2D1::RectF(row.left + 14, timeTop, textRight, row.bottom - rowH * 0.05f),
+                fSmall, pal.textSecondary);
 
             if (!g->fullscreen) {
                 float rowCenterY = (row.top + row.bottom) / 2.0f;
                 D2D1_RECT_F delBtn = D2D1::RectF(row.right - 32, rowCenterY - 13, row.right - 6, rowCenterY + 13);
-                roundedRect(delBtn, 8, hex(kErrorLight, 0.14f));
-                text(L"", delBtn, g->fmtIcon, hex(kErrorLight), DWRITE_TEXT_ALIGNMENT_CENTER);
+                roundedRect(delBtn, 8, withAlpha(pal.error, 0.14f));
+                text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
                 g->periodDeleteRects[idx] = delBtn;
             }
             g->periodRowRects[idx] = row;
@@ -775,7 +882,7 @@ void drawFrame(HWND hwnd) {
             g->rectAddPeriod = D2D1::RectF(0, 0, 0, 0);
         }
     } else {
-        text(L"시험 일정 없음", D2D1::RectF(rx, ry, rightCard.right - 24, ry + 30), g->fmtBody, pal.textTertiary);
+        text(L"시험 일정 없음", D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + fBody->GetFontSize() * 1.5f), fBody, pal.textTertiary);
     }
 
     // ---- Bottom fixed notices ----
@@ -795,7 +902,8 @@ void drawFrame(HWND hwnd) {
             notices += active->notices[i];
             if (i + 1 < active->notices.size()) notices += L"   ·   ";
         }
-        text(notices, D2D1::RectF(noticeTextLeft, noticeY, size.width - pad - 260, noticeY + noticeHeight), g->fmtSmall, pal.textTertiary);
+        float noticeRightMargin = g->fullscreen ? pad : 260.0f;
+        text(notices, D2D1::RectF(noticeTextLeft, noticeY, size.width - noticeRightMargin, noticeY + noticeHeight), fSmall, pal.textTertiary);
     }
 
     // Footer / about (verbatim brand format) — windowed/admin view only; the
