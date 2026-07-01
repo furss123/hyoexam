@@ -7,6 +7,8 @@
 #include <shellapi.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#define _RICHEDIT_VER 0x0500 // CHARFORMAT2W / RICHEDIT50W (Msftedit.dll)
+#include <richedit.h>
 #include <string>
 #include <vector>
 #include <ctime>
@@ -44,6 +46,7 @@ constexpr int kIdComboStartMinute = 107;
 constexpr int kIdComboEndHour = 108;
 constexpr int kIdComboEndMinute = 109;
 constexpr int kIdEditProfileName = 110;
+constexpr int kIdRichMemo = 111;
 
 // Malgun Gothic ships with every Windows 10/11 install (it's the OS's own
 // Korean UI font) — no bundling, no missing-font fallback surprises.
@@ -207,6 +210,18 @@ struct AppState {
     // profile save. toastShownAtMs == 0 means no toast is active.
     std::wstring toastText;
     ULONGLONG toastShownAtMs = 0;
+
+    // Free-write memo under the clock (RichEdit control, so per-selection bold/
+    // underline/size/colors come for free instead of hand-rolled rich text).
+    // Always visible in both windowed and fullscreen; only editable/toolbar-
+    // enabled in windowed mode.
+    HWND hRichMemo = nullptr;
+    D2D1_RECT_F rectMemoEdit{};
+    D2D1_RECT_F rectMemoEditApplied{ -1, -1, -1, -1 }; // last rect actually SetWindowPos'd, so idle frames skip it
+    int memoReadOnlyApplied = -1; // -1 = never set; avoids re-sending EM_SETREADONLY every idle frame
+    D2D1_RECT_F rectMemoBold{}, rectMemoUnderline{}, rectMemoSizeDown{}, rectMemoSizeUp{}, rectMemoFontColor{}, rectMemoBgColor{};
+    bool memoBoldActive = false, memoUnderlineActive = false;
+    COLORREF memoCustomColors[16]{}; // persists the ChooseColor "custom colors" row across both pickers
 
     HWND hEditLabel = nullptr, hEditSubject = nullptr;
     HWND hComboStartHour = nullptr, hComboStartMinute = nullptr, hComboEndHour = nullptr, hComboEndMinute = nullptr;
@@ -601,6 +616,171 @@ void syncNativeControls() {
             (int)(g->rectProfileNameField.right - g->rectProfileNameField.left),
             (int)(g->rectProfileNameField.bottom - g->rectProfileNameField.top), SWP_NOZORDER | SWP_NOACTIVATE);
     }
+
+    // The memo is a permanent part of the layout (not a popup-triggered field),
+    // so it's always visible -- repositioned only when the target rect actually
+    // changes (resize/fullscreen toggle). Calling SetWindowPos unconditionally
+    // on every WM_PAINT caused a self-perpetuating repaint storm that starved
+    // WM_TIMER entirely (the child reposition was itself invalidating the
+    // WS_CLIPCHILDREN parent, queuing another WM_PAINT before the message loop
+    // ever got back around to the timer message).
+    if (g->hRichMemo) {
+        const D2D1_RECT_F& r = g->rectMemoEdit;
+        D2D1_RECT_F& applied = g->rectMemoEditApplied;
+        if (r.left != applied.left || r.top != applied.top || r.right != applied.right || r.bottom != applied.bottom) {
+            SetWindowPos(g->hRichMemo, nullptr, (int)r.left, (int)r.top,
+                (int)(r.right - r.left), (int)(r.bottom - r.top), SWP_NOZORDER | SWP_NOACTIVATE);
+            applied = r;
+        }
+        int wantReadOnly = g->fullscreen ? 1 : 0;
+        if (wantReadOnly != g->memoReadOnlyApplied) {
+            SendMessageW(g->hRichMemo, EM_SETREADONLY, wantReadOnly, 0);
+            g->memoReadOnlyApplied = wantReadOnly;
+        }
+    }
+}
+
+// ---- Free-write memo persistence (RTF, so bold/underline/size/colors survive) ----
+
+std::wstring memoRtfPath() {
+    PWSTR appData = nullptr;
+    std::wstring dir = L".";
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) {
+        dir = appData;
+        CoTaskMemFree(appData);
+    }
+    dir += L"\\HyoExam";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\memo.rtf";
+}
+
+// EM_STREAMOUT callback: appends each chunk RichEdit hands us into a std::string.
+DWORD CALLBACK memoStreamOutCallback(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb) {
+    auto* out = reinterpret_cast<std::string*>(cookie);
+    out->append(reinterpret_cast<char*>(buf), cb);
+    *pcb = cb;
+    return 0;
+}
+
+// EM_STREAMIN callback: feeds RichEdit the next chunk from a std::string + read offset.
+DWORD CALLBACK memoStreamInCallback(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb) {
+    auto* state = reinterpret_cast<std::pair<const std::string*, size_t>*>(cookie);
+    const std::string& src = *state->first;
+    size_t remaining = src.size() - state->second;
+    LONG n = (LONG)std::min<size_t>(remaining, (size_t)cb);
+    if (n > 0) memcpy(buf, src.data() + state->second, n);
+    state->second += n;
+    *pcb = n;
+    return 0;
+}
+
+void saveMemoRtf() {
+    if (!g->hRichMemo) return;
+    std::string rtf;
+    EDITSTREAM es{ (DWORD_PTR)&rtf, 0, memoStreamOutCallback };
+    SendMessageW(g->hRichMemo, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+    std::ofstream f(memoRtfPath(), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f.write(rtf.data(), (std::streamsize)rtf.size());
+    SendMessageW(g->hRichMemo, EM_SETMODIFY, FALSE, 0);
+}
+
+void loadMemoRtf() {
+    if (!g->hRichMemo) return;
+    std::ifstream f(memoRtfPath(), std::ios::binary);
+    if (!f) return;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string rtf = ss.str();
+    if (rtf.empty()) return;
+    std::pair<const std::string*, size_t> state{ &rtf, 0 };
+    EDITSTREAM es{ (DWORD_PTR)&state, 0, memoStreamInCallback };
+    SendMessageW(g->hRichMemo, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+}
+
+// ---- Memo formatting toolbar actions (bold/underline/size/colors on selection) ----
+
+CHARFORMAT2W getMemoSelectionFormat() {
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof(cf);
+    SendMessageW(g->hRichMemo, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    return cf;
+}
+
+// Called each frame (windowed only) so the B/U buttons reflect the format at the
+// current selection/caret instead of a stale toggle guess.
+void refreshMemoToolbarState() {
+    CHARFORMAT2W cf = getMemoSelectionFormat();
+    g->memoBoldActive = (cf.dwMask & CFM_BOLD) && (cf.dwEffects & CFE_BOLD);
+    g->memoUnderlineActive = (cf.dwMask & CFM_UNDERLINE) && (cf.dwEffects & CFE_UNDERLINE);
+}
+
+void toggleMemoBold() {
+    bool isBold = g->memoBoldActive;
+    CHARFORMAT2W set{};
+    set.cbSize = sizeof(set);
+    set.dwMask = CFM_BOLD;
+    set.dwEffects = isBold ? 0 : CFE_BOLD;
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&set);
+    SetFocus(g->hRichMemo);
+}
+
+void toggleMemoUnderline() {
+    bool isUnderline = g->memoUnderlineActive;
+    CHARFORMAT2W set{};
+    set.cbSize = sizeof(set);
+    set.dwMask = CFM_UNDERLINE;
+    set.dwEffects = isUnderline ? 0 : CFE_UNDERLINE;
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&set);
+    SetFocus(g->hRichMemo);
+}
+
+// +/-2pt per click, applied to the selection (or the caret's forward-typing
+// format when nothing is selected — standard EM_SETCHARFORMAT/SCF_SELECTION
+// behavior for an empty selection).
+void adjustMemoFontSize(int deltaPt) {
+    CHARFORMAT2W cf = getMemoSelectionFormat();
+    LONG currentTwips = (cf.dwMask & CFM_SIZE) ? cf.yHeight : 200; // 10pt fallback if mixed/unset
+    LONG newTwips = std::clamp<LONG>(currentTwips + deltaPt * 20, 8 * 20, 96 * 20);
+    CHARFORMAT2W set{};
+    set.cbSize = sizeof(set);
+    set.dwMask = CFM_SIZE;
+    set.yHeight = newTwips;
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&set);
+    SetFocus(g->hRichMemo);
+}
+
+// Native color picker for both text and highlight color — avoids hand-rolling a
+// swatch palette, and CHOOSECOLORW's custom-colors row persists across calls.
+void pickMemoColor(bool background) {
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = g->hRichMemo;
+    cc.lpCustColors = g->memoCustomColors;
+    cc.rgbResult = background ? RGB(255, 255, 0) : RGB(0, 0, 0);
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&cc)) return;
+
+    CHARFORMAT2W set{};
+    set.cbSize = sizeof(set);
+    if (background) {
+        set.dwMask = CFM_BACKCOLOR;
+        set.crBackColor = cc.rgbResult;
+    } else {
+        set.dwMask = CFM_COLOR;
+        set.crTextColor = cc.rgbResult;
+    }
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&set);
+    SetFocus(g->hRichMemo);
+}
+
+// Only the canvas background follows the theme -- per-run text/highlight colors
+// the user picked are left alone (SCF_DEFAULT would stomp on them).
+void applyMemoTheme() {
+    if (!g->hRichMemo) return;
+    Palette pal = currentPalette();
+    COLORREF bg = RGB((BYTE)(pal.surface.r * 255), (BYTE)(pal.surface.g * 255), (BYTE)(pal.surface.b * 255));
+    SendMessageW(g->hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)bg);
 }
 
 // ---- Main frame ----
@@ -715,14 +895,21 @@ void drawFrame(HWND hwnd) {
         g->timeSourceDropdownOpen = false;
     }
 
-    // Left column: clock. Right column: today's period timetable. Fixed split
-    // (55/45) tuned for TV/projector signage -- the clock needs less width than
-    // the schedule list to stay legible, so it no longer drags/persists per-user.
-    constexpr float kClockPanelRatio = 0.55f;
+    // Left column: clock (+ memo below it). Right column: today's period
+    // timetable. Fixed split (60/40) tuned for TV/projector signage -- no
+    // longer drags/persists per-user.
+    constexpr float kClockPanelRatio = 0.60f;
     float totalWidth = content.right - content.left;
     float leftWidth = totalWidth * kClockPanelRatio - gap / 2;
     D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
     D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
+
+    // Clock card on top, free-write memo card below it -- fixed 70/30 vertical split.
+    constexpr float kClockVerticalRatio = 0.70f;
+    float leftHeight = leftCard.bottom - leftCard.top;
+    float clockCardH = leftHeight * kClockVerticalRatio - gap / 2;
+    D2D1_RECT_F clockCard = D2D1::RectF(leftCard.left, leftCard.top, leftCard.right, leftCard.top + clockCardH);
+    D2D1_RECT_F memoCard = D2D1::RectF(leftCard.left, clockCard.bottom + gap, leftCard.right, leftCard.bottom);
 
     // The height-only pass in buildFullscreenFonts() can size the clock too wide
     // for narrower card ratios / aspect ratios (it doesn't know the card width
@@ -748,7 +935,7 @@ void drawFrame(HWND hwnd) {
     const ExamSchedule* active = g->scheduleStore.active();
 
     // ---- Left: clock ----
-    roundedRect(leftCard, 16, pal.surface, &pal.cardBorder);
+    roundedRect(clockCard, 16, pal.surface, &pal.cardBorder);
     float cardPad = g->fullscreen ? 32.0f : 24.0f;
     // The sync-status line is admin-facing chrome (which source, synced/not) —
     // fullscreen is the clean student-facing display, so it's windowed-only.
@@ -757,7 +944,7 @@ void drawFrame(HWND hwnd) {
         std::wstring syncLabel = std::wstring(kTimeSources[g->settings.timeSourceIndex].label) +
             (g->timeSync.isSynced() ? L" 시간 동기화됨" : L" 동기화 대기중 (로컬 시간)");
         text(L"● " + syncLabel,
-            D2D1::RectF(leftCard.left + cardPad, leftCard.top + cardPad, leftCard.right - cardPad, leftCard.top + cardPad + syncLabelH),
+            D2D1::RectF(clockCard.left + cardPad, clockCard.top + cardPad, clockCard.right - cardPad, clockCard.top + cardPad + syncLabelH),
             fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
@@ -765,7 +952,7 @@ void drawFrame(HWND hwnd) {
     // a unit within the card (both vertically and horizontally) using the
     // actual chosen font sizes, so fullscreen's much larger clock digits stay
     // visually balanced instead of sitting at windowed-mode offsets.
-    float clockCenterY = leftCard.top + (leftCard.bottom - leftCard.top) / 2.0f;
+    float clockCenterY = clockCard.top + (clockCard.bottom - clockCard.top) / 2.0f;
     float dateLineH = fDate->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
     // Coefficient tuned so the gap ends up half of what it was before the date
@@ -773,10 +960,41 @@ void drawFrame(HWND hwnd) {
     float blockGap = fDate->GetFontSize() * 0.12f;
     float blockTotalH = dateLineH + blockGap + clockLineH;
     float blockTop = clockCenterY - blockTotalH / 2.0f;
-    text(formatDate(st), D2D1::RectF(leftCard.left, blockTop, leftCard.right, blockTop + dateLineH),
+    text(formatDate(st), D2D1::RectF(clockCard.left, blockTop, clockCard.right, blockTop + dateLineH),
         fDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(formatClock(st), D2D1::RectF(leftCard.left, blockTop + dateLineH + blockGap, leftCard.right, blockTop + blockTotalH),
+    text(formatClock(st), D2D1::RectF(clockCard.left, blockTop + dateLineH + blockGap, clockCard.right, blockTop + blockTotalH),
         fClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // ---- Memo card (free-write area under the clock) ----
+    roundedRect(memoCard, 16, pal.surface, &pal.cardBorder);
+    {
+        float mx = memoCard.left + cardPad * 0.6f;
+        float toolbarH = g->fullscreen ? 0.0f : 44.0f;
+        if (!g->fullscreen) {
+            refreshMemoToolbarState();
+            float btn = 32, btnGap = 8;
+            float by = memoCard.top + (toolbarH - btn) / 2.0f;
+            float bx = mx;
+            auto memoBtn = [&](D2D1_RECT_F& rect, const wchar_t* label, bool active, D2D1_COLOR_F fg) {
+                rect = D2D1::RectF(bx, by, bx + btn, by + btn);
+                roundedRect(rect, 8, active ? hex(kHyoBlue, 0.30f) : hex(kHyoBlue, 0.10f));
+                text(label, rect, g->fmtSmall, fg, DWRITE_TEXT_ALIGNMENT_CENTER);
+                bx += btn + btnGap;
+            };
+            memoBtn(g->rectMemoBold, L"B", g->memoBoldActive, hex(kHyoBlue));
+            memoBtn(g->rectMemoUnderline, L"U", g->memoUnderlineActive, hex(kHyoBlue));
+            memoBtn(g->rectMemoSizeDown, L"A-", false, hex(kHyoBlue));
+            memoBtn(g->rectMemoSizeUp, L"A+", false, hex(kHyoBlue));
+            memoBtn(g->rectMemoFontColor, L"가", false, hex(kHyoBlue));
+            memoBtn(g->rectMemoBgColor, L"■", false, hex(kOrange));
+        } else {
+            g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
+            g->rectMemoSizeDown = g->rectMemoSizeUp = D2D1::RectF(0, 0, 0, 0);
+            g->rectMemoFontColor = g->rectMemoBgColor = D2D1::RectF(0, 0, 0, 0);
+        }
+        g->rectMemoEdit = D2D1::RectF(mx, memoCard.top + toolbarH + (g->fullscreen ? cardPad * 0.4f : 4.0f),
+            memoCard.right - cardPad * 0.6f, memoCard.bottom - cardPad * 0.6f);
+    }
 
     // ---- Right: timetable ----
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
@@ -1157,6 +1375,7 @@ void saveProfilesToDisk() {
     f.write(text.data(), (std::streamsize)text.size());
 }
 
+
 hyo::json::Value buildSettingsSnapshotJson() {
     using namespace hyo::json;
     Value v = Value::makeObject();
@@ -1240,6 +1459,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g->hComboEndHour = makeCombo(kIdComboEndHour, 24);
         g->hComboEndMinute = makeCombo(kIdComboEndMinute, 60);
 
+        // Free-write memo under the clock. Msftedit.dll registers RICHEDIT50W;
+        // must be loaded before this CreateWindowExW call.
+        LoadLibraryW(L"Msftedit.dll");
+        g->hRichMemo = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL | ES_AUTOVSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)kIdRichMemo, hInst, nullptr);
+        applyMemoTheme();
+        loadMemoRtf();
+
         return 0;
     }
     case WM_TIMER:
@@ -1249,6 +1477,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // InvalidateRect calls around each click already cover state changes.
         if (g->editingPeriodIndex == -1 && !g->savingProfile) {
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        // Flush memo edits to disk at most once per tick instead of on every
+        // keystroke. EM_GETMODIFY is RichEdit's own built-in dirty flag --
+        // more reliable than trying to catch every EN_CHANGE via WM_COMMAND.
+        if (g->hRichMemo && SendMessageW(g->hRichMemo, EM_GETMODIFY, 0, 0)) {
+            saveMemoRtf();
         }
         return 0;
     case WM_PAINT: {
@@ -1317,8 +1551,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (ptInRect(pt, g->rectThemeToggle)) {
             g->settings.theme = isEffectivelyLight() ? Theme::Dark : Theme::Light;
             g->settings.save();
+            applyMemoTheme();
         } else if (!g->fullscreen && ptInRect(pt, g->rectAddPeriod)) {
             openPeriodEditor(-2);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoBold)) {
+            toggleMemoBold();
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoUnderline)) {
+            toggleMemoUnderline();
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoSizeDown)) {
+            adjustMemoFontSize(-2);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoSizeUp)) {
+            adjustMemoFontSize(2);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoFontColor)) {
+            pickMemoColor(false);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoBgColor)) {
+            pickMemoColor(true);
         } else if (!g->fullscreen) {
             bool handled = false;
             for (auto& [r, id] : g->scheduleButtons) {
@@ -1417,6 +1664,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, kTickTimerId);
+        if (g->hRichMemo && SendMessageW(g->hRichMemo, EM_GETMODIFY, 0, 0)) saveMemoRtf();
         PostQuitMessage(0);
         return 0;
     }
@@ -1453,8 +1701,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-    toggleFullscreen(hwnd); // TV signage display: launch fullscreen by default (Esc/F11 to leave).
+    UpdateWindow(hwnd); // Starts windowed on the main (admin) screen; F11 for the TV/projector fullscreen display.
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
