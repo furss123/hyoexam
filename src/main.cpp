@@ -39,7 +39,6 @@ constexpr UINT kTickIntervalMs = 250;
 // selection go through these.
 constexpr int kIdEditLabel = 101;
 constexpr int kIdEditSubject = 102;
-constexpr int kIdEditNotices = 105;
 constexpr int kIdComboStartHour = 106;
 constexpr int kIdComboStartMinute = 107;
 constexpr int kIdComboEndHour = 108;
@@ -173,10 +172,6 @@ struct AppState {
     D2D1_RECT_F timeSourceOptionRects[kTimeSourceCount]{};
     int hoveredTimeSourceOption = -1;
 
-    // Layout editing: draggable divider between the clock and timetable panels.
-    D2D1_RECT_F rectSplitHandle{};
-    bool draggingSplit = false;
-    float contentLeft = 0, contentWidth = 0;
 
     // Timetable editing.
     int editingPeriodIndex = -1; // -1 = closed, -2 = new period, >=0 = editing that index
@@ -197,11 +192,6 @@ struct AppState {
     std::vector<int> dragOrder; // preview order, holds original indices into active->periods
     float periodListTop = 0, periodRowHeight = 0;
 
-    // Bottom notice text editing.
-    bool editingNotices = false;
-    D2D1_RECT_F rectNoticesEditIcon{};
-    D2D1_RECT_F rectNoticeSave{}, rectNoticeCancel{};
-    D2D1_RECT_F rectNoticesField{};
 
     // Named profiles: a full snapshot of settings + schedules, saved/loaded as
     // one unit (not a file picker — an in-app named-slot list).
@@ -213,9 +203,13 @@ struct AppState {
     D2D1_RECT_F rectProfileLoadClose{};
     std::vector<D2D1_RECT_F> profileRowRects, profileRowDeleteRects;
 
+    // Small fade-out toast (e.g. "저장되었습니다") shown after an action like
+    // profile save. toastShownAtMs == 0 means no toast is active.
+    std::wstring toastText;
+    ULONGLONG toastShownAtMs = 0;
+
     HWND hEditLabel = nullptr, hEditSubject = nullptr;
     HWND hComboStartHour = nullptr, hComboStartMinute = nullptr, hComboEndHour = nullptr, hComboEndMinute = nullptr;
-    HWND hEditNotices = nullptr;
     HWND hEditProfileName = nullptr;
     HFONT hUiFont = nullptr;
 };
@@ -258,6 +252,11 @@ IDWriteTextFormat* makeFormat(const wchar_t* family, float size, DWRITE_FONT_WEI
     IDWriteTextFormat* fmt = nullptr;
     g->dwriteFactory->CreateTextFormat(family, nullptr, weight,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"ko-KR", &fmt);
+    // text() only ever sets horizontal alignment per call, so every format needs
+    // vertical centering here -- otherwise anything drawn into a rect taller than
+    // its text (icon boxes, dropdown buttons, popup buttons) sits glued to the
+    // top instead of centered in the box.
+    if (fmt) fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     return fmt;
 }
 
@@ -453,36 +452,6 @@ void drawPeriodEditor(D2D1_SIZE_F size) {
     text(L"저장", g->rectPeriodSave, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
-// ---- Bottom notice text editor popup ----
-void drawNoticeEditor(D2D1_SIZE_F size) {
-    Palette pal = currentPalette();
-    g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
-
-    float w = 640, h = 440;
-    D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
-    roundedRect(card, 16, pal.surface, &pal.cardBorder);
-
-    float pad = 28;
-    float x = card.left + pad;
-    float y = card.top + pad;
-
-    text(L"안내 문구 편집", D2D1::RectF(x, y, card.right - pad, y + 32), g->fmtHeading, pal.textPrimary);
-    y += 44;
-    text(L"한 줄에 문구 하나씩 입력하세요. 하단에 점(·)으로 구분되어 표시됩니다.",
-        D2D1::RectF(x, y, card.right - pad, y + 22), g->fmtSmall, pal.textTertiary);
-    y += 32;
-
-    float btnY = card.bottom - pad - 40;
-    g->rectNoticesField = D2D1::RectF(x, y, card.right - pad, btnY - 16);
-
-    g->rectNoticeCancel = D2D1::RectF(card.right - pad - 200, btnY, card.right - pad - 104, btnY + 40);
-    roundedRect(g->rectNoticeCancel, 10, hex(0x808080, 0.10f), &pal.cardBorder);
-    text(L"취소", g->rectNoticeCancel, g->fmtSmall, pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    g->rectNoticeSave = D2D1::RectF(card.right - pad - 96, btnY, card.right - pad, btnY + 40);
-    roundedRect(g->rectNoticeSave, 10, hex(kHyoBlue, 0.85f));
-    text(L"저장", g->rectNoticeSave, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
-}
 
 // Floating list under the time-source button — not a full modal, just a small
 // card, so the rest of the toolbar stays visible while choosing.
@@ -625,14 +594,6 @@ void syncNativeControls() {
         placeCombo(g->hComboEndMinute, g->rectFieldEndMinute);
     }
 
-    bool showNotices = g->editingNotices;
-    ShowWindow(g->hEditNotices, showNotices ? SW_SHOWNA : SW_HIDE);
-    if (showNotices) {
-        SetWindowPos(g->hEditNotices, nullptr, (int)g->rectNoticesField.left, (int)g->rectNoticesField.top,
-            (int)(g->rectNoticesField.right - g->rectNoticesField.left),
-            (int)(g->rectNoticesField.bottom - g->rectNoticesField.top), SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-
     bool showProfileName = g->savingProfile;
     ShowWindow(g->hEditProfileName, showProfileName ? SW_SHOWNA : SW_HIDE);
     if (showProfileName) {
@@ -675,18 +636,13 @@ void drawFrame(HWND hwnd) {
     float pad = 48;    // horizontal margin (left/right) — unchanged
     float padV = 24;   // vertical margin (top/bottom) — halved from the old 48 to cut the dead space above/below the cards
     float gap = 24;
-    // Notice strip stays visible in fullscreen (legible-from-across-the-room
-    // reminders), so its height scales with fSmall's fullscreen-sized font
-    // instead of staying fixed at the small windowed value.
-    float noticeHeight = g->fullscreen ? fSmall->GetFontSize() * 2.0f : 56.0f;
     // Fullscreen is the clean student-facing display: no admin toolbar, no footer.
     float footerHeight = g->fullscreen ? 0.0f : 40.0f;
     // 54px icon boxes need at least that much room in the toolbar band.
     float topBarHeight = g->fullscreen ? 0.0f : 70.0f;
 
-    // Content area = everything below the admin toolbar and above the bottom
-    // notices/footer strip.
-    D2D1_RECT_F content = D2D1::RectF(pad, padV + topBarHeight, size.width - pad, size.height - padV - noticeHeight - footerHeight);
+    // Content area = everything below the admin toolbar and above the footer.
+    D2D1_RECT_F content = D2D1::RectF(pad, padV + topBarHeight, size.width - pad, size.height - padV - footerHeight);
 
     // Admin toolbar sits above both cards -- global app controls, not tied to
     // either panel. Hidden entirely in fullscreen (student-facing display).
@@ -745,12 +701,12 @@ void drawFrame(HWND hwnd) {
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         // Fullscreen still exposes one unobtrusive "return to window" icon,
-        // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
+        // top-left corner, for mouse-only setups (no keyboard for Esc/F11).
         // Only the hit-rect is computed here -- the actual drawing happens near
-        // the end of drawFrame, after the schedule card's rounded-corner fill
+        // the end of drawFrame, after the clock card's rounded-corner fill
         // would otherwise paint right over this same corner and hide it.
         float iconSize = 54;
-        g->rectFullscreenBtn = D2D1::RectF(size.width - pad - iconSize, padV, size.width - pad, padV + iconSize);
+        g->rectFullscreenBtn = D2D1::RectF(pad, padV, pad + iconSize, padV + iconSize);
         g->rectThemeToggle = D2D1::RectF(0, 0, 0, 0);
         g->rectSaveIcon = D2D1::RectF(0, 0, 0, 0);
         g->rectLoadIcon = D2D1::RectF(0, 0, 0, 0);
@@ -759,12 +715,12 @@ void drawFrame(HWND hwnd) {
         g->timeSourceDropdownOpen = false;
     }
 
-    // Left column: clock. Right column: today's period timetable. Split is
-    // user-adjustable (drag handle, windowed only) via settings.splitRatio.
+    // Left column: clock. Right column: today's period timetable. Fixed split
+    // (55/45) tuned for TV/projector signage -- the clock needs less width than
+    // the schedule list to stay legible, so it no longer drags/persists per-user.
+    constexpr float kClockPanelRatio = 0.55f;
     float totalWidth = content.right - content.left;
-    g->contentLeft = content.left;
-    g->contentWidth = totalWidth;
-    float leftWidth = totalWidth * g->settings.splitRatio - gap / 2;
+    float leftWidth = totalWidth * kClockPanelRatio - gap / 2;
     D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
     D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
 
@@ -787,23 +743,6 @@ void drawFrame(HWND hwnd) {
             }
             g->fsClockCorrectedForWidth = cardWidth;
         }
-    }
-
-    if (!g->fullscreen) {
-        g->rectSplitHandle = D2D1::RectF(leftCard.right + gap / 2 - 6, content.top, leftCard.right + gap / 2 + 6, content.bottom);
-        roundedRect(g->rectSplitHandle, 6, hex(kHyoBlue, g->draggingSplit ? 0.55f : 0.30f));
-        // A "<>" knob at the vertical midpoint makes the draggable divider
-        // visually obvious instead of relying on the user to discover it by
-        // hovering/dragging a plain line.
-        float knobW = 40, knobH = 44;
-        float knobCenterY = (content.top + content.bottom) / 2.0f;
-        D2D1_RECT_F knob = D2D1::RectF(leftCard.right + gap / 2 - knobW / 2, knobCenterY - knobH / 2,
-            leftCard.right + gap / 2 + knobW / 2, knobCenterY + knobH / 2);
-        roundedRect(knob, 12, hex(kHyoBlue, g->draggingSplit ? 0.85f : 0.55f));
-        text(L"", D2D1::RectF(knob.left, knob.top, knob.left + knobW / 2, knob.bottom), g->fmtIcon, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
-        text(L"", D2D1::RectF(knob.left + knobW / 2, knob.top, knob.right, knob.bottom), g->fmtIcon, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
-    } else {
-        g->rectSplitHandle = D2D1::RectF(0, 0, 0, 0);
     }
 
     const ExamSchedule* active = g->scheduleStore.active();
@@ -934,9 +873,9 @@ void drawFrame(HWND hwnd) {
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
             float timeTop = titleTop + titleH + lineGap;
-            text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, titleTop, textRight, titleTop + titleH),
+            text(p.label + L" " + p.subject, D2D1::RectF(row.left + 14, titleTop, textRight, titleTop + titleH),
                 rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
-            text(p.start.format() + L" ~ " + p.end.format() + L"  (" + std::to_wstring(p.durationMinutes) + L"분)",
+            text(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
                 D2D1::RectF(row.left + 14, timeTop, textRight, timeTop + timeH),
                 rowTimeFmt, pal.textSecondary);
 
@@ -962,28 +901,6 @@ void drawFrame(HWND hwnd) {
         }
     } else {
         text(L"시험 일정 없음", D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + fBody->GetFontSize() * 1.5f), fBody, pal.textTertiary);
-    }
-
-    // ---- Bottom fixed notices ----
-    float noticeY = content.bottom + 14;
-    float noticeTextLeft = pad;
-    if (!g->fullscreen && active) {
-        // Icon box is 1.5x the original 28px, matching the other enlarged icon boxes.
-        g->rectNoticesEditIcon = D2D1::RectF(pad, noticeY, pad + 42, noticeY + 42);
-        roundedRect(g->rectNoticesEditIcon, 10, hex(kHyoBlue, 0.14f));
-        text(L"", g->rectNoticesEditIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-        noticeTextLeft = pad + 52;
-    } else {
-        g->rectNoticesEditIcon = D2D1::RectF(0, 0, 0, 0);
-    }
-    if (active && !active->notices.empty()) {
-        std::wstring notices;
-        for (size_t i = 0; i < active->notices.size(); i++) {
-            notices += active->notices[i];
-            if (i + 1 < active->notices.size()) notices += L"   ·   ";
-        }
-        float noticeRightMargin = g->fullscreen ? pad : 260.0f;
-        text(notices, D2D1::RectF(noticeTextLeft, noticeY, size.width - noticeRightMargin, noticeY + noticeHeight), fSmall, pal.textTertiary);
     }
 
     // Footer / about (verbatim brand format) — windowed/admin view only; the
@@ -1013,9 +930,27 @@ void drawFrame(HWND hwnd) {
     }
 
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
-    if (g->editingNotices) drawNoticeEditor(size);
     if (g->savingProfile) drawSaveProfilePopup(size);
     if (g->loadingProfile) drawLoadProfilePopup(size);
+
+    // Small fade-out confirmation toast (e.g. after profile save). Time-based
+    // rather than a fixed frame count so it fades the same regardless of the
+    // 250ms tick rate.
+    if (g->toastShownAtMs != 0) {
+        ULONGLONG elapsed = GetTickCount64() - g->toastShownAtMs;
+        const ULONGLONG visibleMs = 1400, fadeMs = 600, totalMs = visibleMs + fadeMs;
+        if (elapsed < totalMs) {
+            float alpha = elapsed < visibleMs ? 1.0f : 1.0f - (float)(elapsed - visibleMs) / (float)fadeMs;
+            float toastW = 200, toastH = 56;
+            float toastBottom = size.height - padV - footerHeight - 16;
+            D2D1_RECT_F toastRect = D2D1::RectF((size.width - toastW) / 2, toastBottom - toastH,
+                (size.width + toastW) / 2, toastBottom);
+            roundedRect(toastRect, 14, hex(0x1F2937, 0.92f * alpha));
+            text(g->toastText, toastRect, g->fmtSmall, hex(0xFFFFFF, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            g->toastShownAtMs = 0;
+        }
+    }
     if (g->timeSourceDropdownOpen) drawTimeSourceDropdown();
 
     HRESULT hr = g->renderTarget->EndDraw();
@@ -1041,8 +976,6 @@ void toggleFullscreen(HWND hwnd) {
         g->fullscreen = true;
         // Fullscreen is the student-facing display — always land on a clean view.
         g->editingPeriodIndex = -1;
-        g->editingNotices = false;
-        g->draggingSplit = false;
         g->timeSourceDropdownOpen = false;
         g->savingProfile = false;
         g->loadingProfile = false;
@@ -1160,38 +1093,6 @@ void commitPeriodDragReorder() {
     g->dragOrder.clear();
 }
 
-void openNoticeEditor() {
-    ExamSchedule* sc = g->scheduleStore.activeMutable();
-    std::wstring joined;
-    if (sc) {
-        for (size_t i = 0; i < sc->notices.size(); i++) {
-            joined += sc->notices[i];
-            if (i + 1 < sc->notices.size()) joined += L"\r\n";
-        }
-    }
-    SetWindowTextW(g->hEditNotices, joined.c_str());
-    g->editingNotices = true;
-}
-
-void saveNoticeEditor() {
-    ExamSchedule* sc = g->scheduleStore.activeMutable();
-    if (sc) {
-        std::wstring text = getEditText(g->hEditNotices);
-        sc->notices.clear();
-        size_t start = 0;
-        while (start <= text.size()) {
-            size_t end = text.find(L'\n', start);
-            if (end == std::wstring::npos) end = text.size();
-            std::wstring line = text.substr(start, end - start);
-            while (!line.empty() && (line.back() == L'\r')) line.pop_back();
-            if (!line.empty()) sc->notices.push_back(line);
-            start = end + 1;
-        }
-        g->scheduleStore.saveToFile(g->dataPath);
-    }
-    g->editingNotices = false;
-}
-
 // ---- Named profiles (save/load everything as one named snapshot) ----
 
 std::wstring utf8ToWideMain(const std::string& s) {
@@ -1260,7 +1161,6 @@ hyo::json::Value buildSettingsSnapshotJson() {
     using namespace hyo::json;
     Value v = Value::makeObject();
     v.set("theme", Value::makeString(g->settings.theme == Theme::Light ? "light" : g->settings.theme == Theme::Dark ? "dark" : "auto"));
-    v.set("splitRatio", Value::makeNumber(g->settings.splitRatio));
     v.set("timeSourceIndex", Value::makeNumber(g->settings.timeSourceIndex));
     return v;
 }
@@ -1268,13 +1168,12 @@ hyo::json::Value buildSettingsSnapshotJson() {
 void applySettingsSnapshotJson(const hyo::json::Value& v) {
     std::string themeStr = v["theme"].asString("auto");
     g->settings.theme = themeStr == "light" ? Theme::Light : themeStr == "dark" ? Theme::Dark : Theme::Auto;
-    g->settings.splitRatio = (float)v["splitRatio"].asNumber(0.70);
     g->settings.timeSourceIndex = (int)v["timeSourceIndex"].asNumber(0);
     if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
 }
 
-void saveCurrentAsProfile(const std::wstring& name) {
-    if (name.empty()) return;
+bool saveCurrentAsProfile(const std::wstring& name) {
+    if (name.empty()) return false;
     SavedProfile sp;
     sp.name = name;
     sp.settingsJson = buildSettingsSnapshotJson();
@@ -1286,6 +1185,7 @@ void saveCurrentAsProfile(const std::wstring& name) {
     }
     if (!replaced) g->profiles.push_back(sp);
     saveProfilesToDisk();
+    return true;
 }
 
 void loadProfileByIndex(int idx) {
@@ -1322,7 +1222,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         };
         g->hEditLabel = makeEdit(kIdEditLabel, ES_AUTOHSCROLL);
         g->hEditSubject = makeEdit(kIdEditSubject, ES_AUTOHSCROLL);
-        g->hEditNotices = makeEdit(kIdEditNotices, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL);
         g->hEditProfileName = makeEdit(kIdEditProfileName, ES_AUTOHSCROLL);
 
         auto makeCombo = [&](int id, int itemCount) {
@@ -1348,7 +1247,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // full-surface present on every repaint fights the child Edit control's own
         // paint and blanks out whatever the user just typed. The explicit
         // InvalidateRect calls around each click already cover state changes.
-        if (g->editingPeriodIndex == -1 && !g->editingNotices && !g->savingProfile) {
+        if (g->editingPeriodIndex == -1 && !g->savingProfile) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -1372,12 +1271,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (ptInRect(pt, g->rectPeriodSave)) savePeriodEditor();
             else if (ptInRect(pt, g->rectPeriodCancel)) closePeriodEditor();
             else if (ptInRect(pt, g->rectPeriodDelete)) deletePeriodEditor();
-        } else if (g->editingNotices) {
-            if (ptInRect(pt, g->rectNoticeSave)) saveNoticeEditor();
-            else if (ptInRect(pt, g->rectNoticeCancel)) g->editingNotices = false;
         } else if (g->savingProfile) {
             if (ptInRect(pt, g->rectProfileSaveBtn)) {
-                saveCurrentAsProfile(getEditText(g->hEditProfileName));
+                if (saveCurrentAsProfile(getEditText(g->hEditProfileName))) {
+                    g->toastText = L"저장되었습니다";
+                    g->toastShownAtMs = GetTickCount64();
+                }
                 g->savingProfile = false;
             } else if (ptInRect(pt, g->rectProfileSaveCancel)) {
                 g->savingProfile = false;
@@ -1418,12 +1317,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (ptInRect(pt, g->rectThemeToggle)) {
             g->settings.theme = isEffectivelyLight() ? Theme::Dark : Theme::Light;
             g->settings.save();
-        } else if (!g->fullscreen && ptInRect(pt, g->rectSplitHandle)) {
-            g->draggingSplit = true;
         } else if (!g->fullscreen && ptInRect(pt, g->rectAddPeriod)) {
             openPeriodEditor(-2);
-        } else if (!g->fullscreen && ptInRect(pt, g->rectNoticesEditIcon)) {
-            openNoticeEditor();
         } else if (!g->fullscreen) {
             bool handled = false;
             for (auto& [r, id] : g->scheduleButtons) {
@@ -1451,13 +1346,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         POINT pt{ LOWORD(lParam), HIWORD(lParam) };
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
-        if (g->draggingSplit) {
-            float ratio = (pt.x - g->contentLeft) / g->contentWidth;
-            g->settings.splitRatio = std::max(0.40f, std::min(0.85f, ratio));
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
         if (g->pendingIsPeriodClick) {
             int dx = pt.x - g->mouseDownPt.x, dy = pt.y - g->mouseDownPt.y;
             if (!g->isDraggingPeriod && (std::abs(dx) > 6 || std::abs(dy) > 6)) {
@@ -1516,15 +1404,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g->hoveredSiteLink) { g->hoveredSiteLink = false; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     case WM_LBUTTONUP:
-        if (g->draggingSplit) { g->draggingSplit = false; g->settings.save(); }
-        else if (g->isDraggingPeriod) { commitPeriodDragReorder(); InvalidateRect(hwnd, nullptr, FALSE); }
+        if (g->isDraggingPeriod) { commitPeriodDragReorder(); InvalidateRect(hwnd, nullptr, FALSE); }
         else if (g->pendingIsPeriodClick) { openPeriodEditor(g->pendingClickPeriodIndex); InvalidateRect(hwnd, nullptr, FALSE); }
         g->pendingIsPeriodClick = false;
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11) toggleFullscreen(hwnd);
         else if (wParam == VK_ESCAPE && g->editingPeriodIndex != -1) { closePeriodEditor(); InvalidateRect(hwnd, nullptr, FALSE); }
-        else if (wParam == VK_ESCAPE && g->editingNotices) { g->editingNotices = false; InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->savingProfile) { g->savingProfile = false; InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->loadingProfile) { g->loadingProfile = false; InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->fullscreen) { toggleFullscreen(hwnd); }

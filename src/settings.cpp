@@ -47,7 +47,6 @@ bool Settings::load() {
     std::string themeStr = root["theme"].asString("auto");
     theme = themeStr == "light" ? Theme::Light : themeStr == "dark" ? Theme::Dark : Theme::Auto;
     fontScale = (float)root["fontScale"].asNumber(1.0);
-    splitRatio = (float)root["splitRatio"].asNumber(0.70);
     timeSourceIndex = (int)root["timeSourceIndex"].asNumber(0);
     activeScheduleId = utf8ToWide(root["activeScheduleId"].asString());
     return true;
@@ -58,7 +57,6 @@ bool Settings::save() const {
     Value root = Value::makeObject();
     root.set("theme", Value::makeString(theme == Theme::Light ? "light" : theme == Theme::Auto ? "auto" : "dark"));
     root.set("fontScale", Value::makeNumber(fontScale));
-    root.set("splitRatio", Value::makeNumber(splitRatio));
     root.set("timeSourceIndex", Value::makeNumber(timeSourceIndex));
     root.set("activeScheduleId", Value::makeString(wideToUtf8(activeScheduleId)));
 
