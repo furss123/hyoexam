@@ -49,6 +49,10 @@ public:
     void setActive(const std::wstring& id) { activeId_ = id; }
     const std::wstring& activeId() const { return activeId_; }
     const ExamSchedule* active() const { return find(activeId_); }
+    ExamSchedule* activeMutable() {
+        for (auto& sc : schedules_) if (sc.id == activeId_) return &sc;
+        return schedules_.empty() ? nullptr : &schedules_[0];
+    }
 
 private:
     std::vector<ExamSchedule> schedules_;
