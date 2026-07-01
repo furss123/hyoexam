@@ -130,7 +130,8 @@ struct AppState {
     IDWriteTextFormat* fmtBody = nullptr;
     IDWriteTextFormat* fmtSmall = nullptr;
     IDWriteTextFormat* fmtVersion = nullptr;
-    IDWriteTextFormat* fmtIcon = nullptr;
+    IDWriteTextFormat* fmtIcon = nullptr;      // inline glyphs (footer link arrow, dropdown chevron)
+    IDWriteTextFormat* fmtIconBox = nullptr;   // larger glyphs inside boxed icon buttons (save/load/theme/fullscreen/delete)
 
     // Fullscreen (TV/projector) variants of clock/date/body/small — sized off the
     // actual monitor resolution so the student-facing display fills the frame
@@ -141,6 +142,13 @@ struct AppState {
     IDWriteTextFormat* fmtSmallFS = nullptr;
     float fsFontsBuiltForHeight = -1.0f;
     float fsClockCorrectedForWidth = -1.0f;
+
+    // Fullscreen period-row title/time text is sized off the actual row height
+    // (not a fixed windowed size), so a handful of periods fill their large
+    // rows and many periods still fit legibly — same idea as fmtClockFS.
+    IDWriteTextFormat* fmtPeriodTitleFS = nullptr;
+    IDWriteTextFormat* fmtPeriodTimeFS = nullptr;
+    float fsPeriodBuiltForRowH = -1.0f;
 
     Settings settings;
     ScheduleStore scheduleStore;
@@ -266,7 +274,7 @@ void buildFonts() {
 
     const wchar_t* family = kUiFontFamily;
     g->fmtClock = makeFormat(family, 150.0f, DWRITE_FONT_WEIGHT_BOLD);
-    g->fmtDate = makeFormat(family, 28.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    g->fmtDate = makeFormat(family, 70.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD); // 2.5x the original 28pt, per explicit request
     g->fmtHeading = makeFormat(family, 22.0f, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtBody = makeFormat(family, 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmall = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_NORMAL);
@@ -290,7 +298,7 @@ void buildFullscreenFonts(float height) {
 
     const wchar_t* family = kUiFontFamily;
     float clockSize = std::clamp(height * 0.34f, 120.0f, 520.0f);
-    float dateSize = std::clamp(height * 0.034f, 26.0f, 64.0f);
+    float dateSize = std::clamp(height * 0.085f, 65.0f, 160.0f); // 2.5x the original 0.034/26-64 range
     float bodySize = std::clamp(height * 0.032f, 20.0f, 56.0f);
     float smallSize = std::clamp(height * 0.024f, 16.0f, 40.0f);
 
@@ -308,6 +316,20 @@ void buildFullscreenFonts(float height) {
     g->fsClockCorrectedForWidth = -1.0f; // force the width-fit re-check in drawFrame against the fresh clock format
 }
 
+// Fullscreen period-row title/time text, sized off the actual row height so a
+// handful of periods (large rows) fill them instead of leaving a fixed small
+// font floating in a mostly-empty box, while many periods (small rows) still
+// shrink to fit legibly. Rebuilt only when rowH actually changes.
+void buildPeriodRowFonts(float rowH) {
+    if (g->fmtPeriodTitleFS) g->fmtPeriodTitleFS->Release();
+    if (g->fmtPeriodTimeFS) g->fmtPeriodTimeFS->Release();
+    float titleSize = std::clamp(rowH * 0.26f, 22.0f, 120.0f);
+    float timeSize = std::clamp(rowH * 0.18f, 16.0f, 80.0f);
+    g->fmtPeriodTitleFS = makeFormat(kUiFontFamily, titleSize, DWRITE_FONT_WEIGHT_MEDIUM);
+    g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_NORMAL);
+    g->fsPeriodBuiltForRowH = rowH;
+}
+
 void createDeviceIndependentResources() {
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g->d2dFactory);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -318,6 +340,10 @@ void createDeviceIndependentResources() {
     // Segoe MDL2 Assets ships with Windows 10/11 and is what Explorer/Settings use
     // for their own toolbar glyphs — crisper and more reliable than emoji fallback.
     g->fmtIcon = makeFormat(L"Segoe MDL2 Assets", 17.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    // Larger variant for glyphs inside boxed icon buttons (toolbar/delete), which
+    // got 1.5x bigger hit targets — kept separate from fmtIcon so inline glyphs
+    // (footer link arrow, dropdown chevron) stay at their original small size.
+    g->fmtIconBox = makeFormat(L"Segoe MDL2 Assets", 26.0f, DWRITE_FONT_WEIGHT_NORMAL);
 }
 
 void discardDeviceResources() {
@@ -527,7 +553,7 @@ void drawLoadProfilePopup(D2D1_SIZE_F size) {
     g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
 
     float w = 420;
-    float rowH = 52;
+    float rowH = 60; // roomier now that the delete icon box is 1.5x bigger
     float listH = g->profiles.empty() ? 60.0f : (float)g->profiles.size() * rowH;
     float h = 120 + listH;
     D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
@@ -548,13 +574,14 @@ void drawLoadProfilePopup(D2D1_SIZE_F size) {
         for (size_t i = 0; i < g->profiles.size(); i++) {
             D2D1_RECT_F row = D2D1::RectF(x, y, card.right - pad, y + rowH - 10);
             roundedRect(row, 10, hex(kHyoBlue, 0.08f), &pal.cardBorder);
-            text(g->profiles[i].name, D2D1::RectF(row.left + 14, row.top, row.right - 46, row.bottom),
+            text(g->profiles[i].name, D2D1::RectF(row.left + 14, row.top, row.right - 58, row.bottom),
                 g->fmtBody, pal.textPrimary);
 
-            D2D1_RECT_F delBtn = D2D1::RectF(row.right - 34, row.top + (row.bottom - row.top - 26) / 2,
-                row.right - 8, row.top + (row.bottom - row.top - 26) / 2 + 26);
-            roundedRect(delBtn, 8, withAlpha(pal.error, 0.14f));
-            text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+            // Icon box is 1.5x the original 26px, matching the other enlarged icon boxes.
+            D2D1_RECT_F delBtn = D2D1::RectF(row.right - 47, row.top + (row.bottom - row.top - 39) / 2,
+                row.right - 8, row.top + (row.bottom - row.top - 39) / 2 + 39);
+            roundedRect(delBtn, 12, withAlpha(pal.error, 0.14f));
+            text(L"", delBtn, g->fmtIconBox, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             g->profileRowRects[i] = row;
             g->profileRowDeleteRects[i] = delBtn;
@@ -645,7 +672,8 @@ void drawFrame(HWND hwnd) {
     st.wDayOfWeek = local.tm_wday;
     int nowMinutes = st.wHour * 60 + st.wMinute;
 
-    float pad = 48;
+    float pad = 48;    // horizontal margin (left/right) — unchanged
+    float padV = 24;   // vertical margin (top/bottom) — halved from the old 48 to cut the dead space above/below the cards
     float gap = 24;
     // Notice strip stays visible in fullscreen (legible-from-across-the-room
     // reminders), so its height scales with fSmall's fullscreen-sized font
@@ -653,11 +681,12 @@ void drawFrame(HWND hwnd) {
     float noticeHeight = g->fullscreen ? fSmall->GetFontSize() * 2.0f : 56.0f;
     // Fullscreen is the clean student-facing display: no admin toolbar, no footer.
     float footerHeight = g->fullscreen ? 0.0f : 40.0f;
-    float topBarHeight = g->fullscreen ? 0.0f : 52.0f;
+    // 54px icon boxes need at least that much room in the toolbar band.
+    float topBarHeight = g->fullscreen ? 0.0f : 70.0f;
 
     // Content area = everything below the admin toolbar and above the bottom
     // notices/footer strip.
-    D2D1_RECT_F content = D2D1::RectF(pad, pad + topBarHeight, size.width - pad, size.height - pad - noticeHeight - footerHeight);
+    D2D1_RECT_F content = D2D1::RectF(pad, padV + topBarHeight, size.width - pad, size.height - padV - noticeHeight - footerHeight);
 
     // Admin toolbar sits above both cards -- global app controls, not tied to
     // either panel. Hidden entirely in fullscreen (student-facing display).
@@ -665,34 +694,35 @@ void drawFrame(HWND hwnd) {
         // Unified 12px spacing grid for the whole toolbar row (icon-to-icon,
         // tab-to-tab, tab-to-dropdown), and icons/tabs share one vertically
         // centered baseline within the topBarHeight band instead of both
-        // being pinned to its top edge.
-        float iconSize = 36, iconGap = 12;
+        // being pinned to its top edge. Icon boxes are 1.5x the original 36px.
+        float iconSize = 54, iconGap = 12;
         float iconsRight = size.width - pad;
-        float iconTop = pad + (topBarHeight - iconSize) / 2.0f;
+        float iconTop = padV + (topBarHeight - iconSize) / 2.0f;
 
         // Right side: theme toggle immediately left of fullscreen.
         g->rectFullscreenBtn = D2D1::RectF(iconsRight - iconSize, iconTop, iconsRight, iconTop + iconSize);
         roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
-        text(g->fullscreen ? L"" : L"", g->rectFullscreenBtn, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(L"", g->rectFullscreenBtn, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
         g->rectThemeToggle = D2D1::RectF(iconsRight - iconSize * 2 - iconGap, iconTop, iconsRight - iconSize - iconGap, iconTop + iconSize);
         roundedRect(g->rectThemeToggle, 10, hex(kHyoBlue, 0.12f));
-        text(isEffectivelyLight() ? L"" : L"", g->rectThemeToggle, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(isEffectivelyLight() ? L"" : L"", g->rectThemeToggle, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
         // Save / load named profiles, left of the theme toggle.
         g->rectLoadIcon = D2D1::RectF(iconsRight - iconSize * 3 - iconGap * 2, iconTop, iconsRight - iconSize * 2 - iconGap * 2, iconTop + iconSize);
         roundedRect(g->rectLoadIcon, 10, hex(kHyoBlue, 0.12f));
-        text(L"", g->rectLoadIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(L"", g->rectLoadIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
         g->rectSaveIcon = D2D1::RectF(iconsRight - iconSize * 4 - iconGap * 3, iconTop, iconsRight - iconSize * 3 - iconGap * 3, iconTop + iconSize);
         roundedRect(g->rectSaveIcon, 10, hex(kHyoBlue, 0.12f));
-        text(L"", g->rectSaveIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(L"", g->rectSaveIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        // Left side: exam-type selector (모의고사 / 지필평가).
+        // Left side: exam-type selector (모의고사 / 지필평가) — narrowed from the
+        // original 140px, which was much wider than the 4-character labels need.
         g->scheduleButtons.clear();
         float bx = pad;
         for (auto& sc : g->scheduleStore.all()) {
-            float bw = 140;
+            float bw = 104;
             D2D1_RECT_F r = D2D1::RectF(bx, iconTop, bx + bw, iconTop + iconSize);
             bool isActive = sc.id == g->scheduleStore.activeId();
             roundedRect(r, 10, isActive ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f), isActive ? nullptr : &pal.cardBorder);
@@ -714,8 +744,16 @@ void drawFrame(HWND hwnd) {
                 g->rectTimeSourceButton.right - 4, g->rectTimeSourceButton.bottom),
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
-        g->rectFullscreenBtn = D2D1::RectF(0, 0, 0, 0);
+        // Fullscreen still exposes one unobtrusive "return to window" icon,
+        // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
+        // Only the hit-rect is computed here -- the actual drawing happens near
+        // the end of drawFrame, after the schedule card's rounded-corner fill
+        // would otherwise paint right over this same corner and hide it.
+        float iconSize = 54;
+        g->rectFullscreenBtn = D2D1::RectF(size.width - pad - iconSize, padV, size.width - pad, padV + iconSize);
         g->rectThemeToggle = D2D1::RectF(0, 0, 0, 0);
+        g->rectSaveIcon = D2D1::RectF(0, 0, 0, 0);
+        g->rectLoadIcon = D2D1::RectF(0, 0, 0, 0);
         g->scheduleButtons.clear();
         g->rectTimeSourceButton = D2D1::RectF(0, 0, 0, 0);
         g->timeSourceDropdownOpen = false;
@@ -754,6 +792,16 @@ void drawFrame(HWND hwnd) {
     if (!g->fullscreen) {
         g->rectSplitHandle = D2D1::RectF(leftCard.right + gap / 2 - 6, content.top, leftCard.right + gap / 2 + 6, content.bottom);
         roundedRect(g->rectSplitHandle, 6, hex(kHyoBlue, g->draggingSplit ? 0.55f : 0.30f));
+        // A "<>" knob at the vertical midpoint makes the draggable divider
+        // visually obvious instead of relying on the user to discover it by
+        // hovering/dragging a plain line.
+        float knobW = 40, knobH = 44;
+        float knobCenterY = (content.top + content.bottom) / 2.0f;
+        D2D1_RECT_F knob = D2D1::RectF(leftCard.right + gap / 2 - knobW / 2, knobCenterY - knobH / 2,
+            leftCard.right + gap / 2 + knobW / 2, knobCenterY + knobH / 2);
+        roundedRect(knob, 12, hex(kHyoBlue, g->draggingSplit ? 0.85f : 0.55f));
+        text(L"", D2D1::RectF(knob.left, knob.top, knob.left + knobW / 2, knob.bottom), g->fmtIcon, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(L"", D2D1::RectF(knob.left + knobW / 2, knob.top, knob.right, knob.bottom), g->fmtIcon, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         g->rectSplitHandle = D2D1::RectF(0, 0, 0, 0);
     }
@@ -763,12 +811,16 @@ void drawFrame(HWND hwnd) {
     // ---- Left: clock ----
     roundedRect(leftCard, 16, pal.surface, &pal.cardBorder);
     float cardPad = g->fullscreen ? 32.0f : 24.0f;
-    float syncLabelH = fSmall->GetFontSize() * 1.6f;
-    std::wstring syncLabel = std::wstring(kTimeSources[g->settings.timeSourceIndex].label) +
-        (g->timeSync.isSynced() ? L" 시간 동기화됨" : L" 동기화 대기중 (로컬 시간)");
-    text(L"● " + syncLabel,
-        D2D1::RectF(leftCard.left + cardPad, leftCard.top + cardPad, leftCard.right - cardPad, leftCard.top + cardPad + syncLabelH),
-        fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    // The sync-status line is admin-facing chrome (which source, synced/not) —
+    // fullscreen is the clean student-facing display, so it's windowed-only.
+    if (!g->fullscreen) {
+        float syncLabelH = fSmall->GetFontSize() * 1.6f;
+        std::wstring syncLabel = std::wstring(kTimeSources[g->settings.timeSourceIndex].label) +
+            (g->timeSync.isSynced() ? L" 시간 동기화됨" : L" 동기화 대기중 (로컬 시간)");
+        text(L"● " + syncLabel,
+            D2D1::RectF(leftCard.left + cardPad, leftCard.top + cardPad, leftCard.right - cardPad, leftCard.top + cardPad + syncLabelH),
+            fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
 
     // Date/weekday on top, big clock below it — the whole block is centered as
     // a unit within the card (both vertically and horizontally) using the
@@ -777,7 +829,9 @@ void drawFrame(HWND hwnd) {
     float clockCenterY = leftCard.top + (leftCard.bottom - leftCard.top) / 2.0f;
     float dateLineH = fDate->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
-    float blockGap = fDate->GetFontSize() * 0.6f;
+    // Coefficient tuned so the gap ends up half of what it was before the date
+    // font itself was made 2.5x bigger (0.6 * 0.5 / 2.5 = 0.12).
+    float blockGap = fDate->GetFontSize() * 0.12f;
     float blockTotalH = dateLineH + blockGap + clockLineH;
     float blockTop = clockCenterY - blockTotalH / 2.0f;
     text(formatDate(st), D2D1::RectF(leftCard.left, blockTop, leftCard.right, blockTop + dateLineH),
@@ -816,6 +870,17 @@ void drawFrame(HWND hwnd) {
         g->periodListTop = ry;
         g->periodRowHeight = rowH;
 
+        // Fullscreen sizes the period title/time text off the actual row height
+        // (rebuilt lazily when rowH changes) so a handful of periods — large
+        // rows — read as big, filled cards instead of small fixed-size text
+        // floating in a mostly-empty box; windowed mode keeps its fixed sizes.
+        if (g->fullscreen && g->fsPeriodBuiltForRowH != rowH) buildPeriodRowFonts(rowH);
+        IDWriteTextFormat* rowTitleFmt = g->fullscreen ? g->fmtPeriodTitleFS : fBody;
+        IDWriteTextFormat* rowTimeFmt = g->fullscreen ? g->fmtPeriodTimeFS : fSmall;
+        // Small fixed gap between period rows — a little breathing room without
+        // eating into the now-uncapped fullscreen row height.
+        float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
+
         g->periodRowRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
         g->periodDeleteRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
 
@@ -834,7 +899,7 @@ void drawFrame(HWND hwnd) {
             bool isHovered = !g->fullscreen && !g->isDraggingPeriod && g->hoveredPeriodRow == idx;
             bool isBeingDragged = g->isDraggingPeriod && g->draggingPeriodIndex == idx;
 
-            D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
+            D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + rowH - rowGapPx);
 
             if (isBeingDragged) {
                 // Soft drop-shadow + bright outline for a "lifted card" feel while dragging.
@@ -847,26 +912,40 @@ void drawFrame(HWND hwnd) {
             } else if (isHovered) {
                 // Subtle "raised" hover cue: brighter fill + visible border, signals it's clickable.
                 roundedRect(row, 10, hex(kHyoBlue, 0.09f), &pal.cardBorder);
+            } else if (g->fullscreen) {
+                // Fullscreen has no hover/current-only affordance to fall back on, and
+                // rows are now large (uncapped rowH) — an outlined card per period makes
+                // that filled space read as one deliberate block instead of stray text
+                // floating in empty background.
+                roundedRect(row, 10, hex(kHyoBlue, 0.05f), &pal.cardBorder);
             }
 
-            float textRight = !g->fullscreen ? row.right - 40 : row.right - 14;
+            float textRight = !g->fullscreen ? row.right - 46 : row.right - 14;
             // Title/time line positions scale off the actual chosen font sizes
             // (rather than fixed 6/34/36/14px offsets) so fullscreen's larger
-            // fBody/fSmall don't clip or crowd inside the also-larger rowH.
-            float titleTop = row.top + rowH * 0.10f;
-            float titleH = fBody->GetFontSize() * 1.3f;
-            float timeTop = titleTop + titleH + fBody->GetFontSize() * 0.15f;
+            // rowTitleFmt/rowTimeFmt don't clip or crowd inside the also-larger rowH.
+            // In fullscreen the text block is centered within the (large,
+            // uncapped) row rather than pinned near the top, since the row IS
+            // the period's whole visual block now.
+            float titleH = rowTitleFmt->GetFontSize() * 1.3f;
+            float timeH = rowTimeFmt->GetFontSize() * 1.3f;
+            float lineGap = rowTitleFmt->GetFontSize() * 0.15f;
+            float titleTop = g->fullscreen
+                ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
+                : row.top + rowH * 0.10f;
+            float timeTop = titleTop + titleH + lineGap;
             text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, titleTop, textRight, titleTop + titleH),
-                fBody, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
+                rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
             text(p.start.format() + L" ~ " + p.end.format() + L"  (" + std::to_wstring(p.durationMinutes) + L"분)",
-                D2D1::RectF(row.left + 14, timeTop, textRight, row.bottom - rowH * 0.05f),
-                fSmall, pal.textSecondary);
+                D2D1::RectF(row.left + 14, timeTop, textRight, timeTop + timeH),
+                rowTimeFmt, pal.textSecondary);
 
             if (!g->fullscreen) {
+                // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
                 float rowCenterY = (row.top + row.bottom) / 2.0f;
-                D2D1_RECT_F delBtn = D2D1::RectF(row.right - 32, rowCenterY - 13, row.right - 6, rowCenterY + 13);
-                roundedRect(delBtn, 8, withAlpha(pal.error, 0.14f));
-                text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+                D2D1_RECT_F delBtn = D2D1::RectF(row.right - 45, rowCenterY - 19.5f, row.right - 6, rowCenterY + 19.5f);
+                roundedRect(delBtn, 12, withAlpha(pal.error, 0.14f));
+                text(L"", delBtn, g->fmtIconBox, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
                 g->periodDeleteRects[idx] = delBtn;
             }
             g->periodRowRects[idx] = row;
@@ -875,7 +954,7 @@ void drawFrame(HWND hwnd) {
         }
 
         if (!g->fullscreen) {
-            g->rectAddPeriod = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
+            g->rectAddPeriod = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + rowH - rowGapPx);
             roundedRect(g->rectAddPeriod, 10, hex(kHyoBlue, 0.10f), &pal.cardBorder);
             text(L"+  교시 추가", g->rectAddPeriod, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
         } else {
@@ -889,10 +968,11 @@ void drawFrame(HWND hwnd) {
     float noticeY = content.bottom + 14;
     float noticeTextLeft = pad;
     if (!g->fullscreen && active) {
-        g->rectNoticesEditIcon = D2D1::RectF(pad, noticeY, pad + 28, noticeY + 28);
-        roundedRect(g->rectNoticesEditIcon, 8, hex(kHyoBlue, 0.14f));
-        text(L"", g->rectNoticesEditIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-        noticeTextLeft = pad + 38;
+        // Icon box is 1.5x the original 28px, matching the other enlarged icon boxes.
+        g->rectNoticesEditIcon = D2D1::RectF(pad, noticeY, pad + 42, noticeY + 42);
+        roundedRect(g->rectNoticesEditIcon, 10, hex(kHyoBlue, 0.14f));
+        text(L"", g->rectNoticesEditIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        noticeTextLeft = pad + 52;
     } else {
         g->rectNoticesEditIcon = D2D1::RectF(0, 0, 0, 0);
     }
@@ -910,8 +990,8 @@ void drawFrame(HWND hwnd) {
     // fullscreen student display stays clean with no small print. The site
     // link is a separate clickable segment so its hit-rect is exact.
     if (!g->fullscreen) {
-        float footerY = size.height - pad - 24;
-        float footerBottom = size.height - pad;
+        float footerY = size.height - padV - 24;
+        float footerBottom = size.height - padV;
 
         g->rectSiteLink = D2D1::RectF(size.width - pad - 78, footerY, size.width - pad, footerBottom);
         text(L"hyot.dev", D2D1::RectF(g->rectSiteLink.left, footerY, g->rectSiteLink.left + 58, footerBottom),
@@ -922,6 +1002,14 @@ void drawFrame(HWND hwnd) {
         std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.  ·";
         text(footer, D2D1::RectF(size.width - pad - 480, footerY, g->rectSiteLink.left - 4, footerBottom),
             g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // Drawn last so the fullscreen return-to-window icon (rect computed earlier,
+    // in the toolbar block) actually sits on top of the schedule card's fill
+    // instead of being painted over by it.
+    if (g->fullscreen) {
+        roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.16f));
+        text(L"", g->rectFullscreenBtn, g->fmtIconBox, hex(kHyoBlue, 0.9f), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
