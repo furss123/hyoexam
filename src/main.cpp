@@ -10,6 +10,7 @@
 #include <vector>
 #include <ctime>
 #include <cwchar>
+#include <cstdlib>
 #include <algorithm>
 
 #include "schedule.h"
@@ -121,6 +122,16 @@ struct AppState {
     D2D1_RECT_F rectAddPeriod{};
     D2D1_RECT_F rectPeriodSave{}, rectPeriodCancel{}, rectPeriodDelete{};
     D2D1_RECT_F rectFieldLabel{}, rectFieldSubject{}, rectFieldStart{}, rectFieldEnd{};
+
+    // Period row hover (click affordance) and drag-to-reorder.
+    int hoveredPeriodRow = -1;
+    bool pendingIsPeriodClick = false;
+    int pendingClickPeriodIndex = -1;
+    POINT mouseDownPt{};
+    bool isDraggingPeriod = false;
+    int draggingPeriodIndex = -1;
+    std::vector<int> dragOrder; // preview order, holds original indices into active->periods
+    float periodListTop = 0, periodRowHeight = 0;
 
     // Bottom notice text editing.
     bool editingNotices = false;
@@ -494,13 +505,41 @@ void drawFrame(HWND hwnd) {
 
         size_t slotCount = active->periods.size() + (!g->fullscreen ? 1 : 0);
         float rowH = std::min(84.0f, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, slotCount));
-        g->periodRowRects.clear();
-        g->periodDeleteRects.clear();
-        for (size_t i = 0; i < active->periods.size(); i++) {
-            const Period& p = active->periods[i];
+        g->periodListTop = ry;
+        g->periodRowHeight = rowH;
+
+        g->periodRowRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
+        g->periodDeleteRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
+
+        std::vector<int> order;
+        if (g->isDraggingPeriod && g->dragOrder.size() == active->periods.size()) {
+            order = g->dragOrder;
+        } else {
+            order.resize(active->periods.size());
+            for (size_t k = 0; k < order.size(); k++) order[k] = (int)k;
+        }
+
+        for (size_t slot = 0; slot < order.size(); slot++) {
+            int idx = order[slot];
+            const Period& p = active->periods[idx];
             bool isCurrent = status.currentPeriod == &p;
+            bool isHovered = !g->fullscreen && !g->isDraggingPeriod && g->hoveredPeriodRow == idx;
+            bool isBeingDragged = g->isDraggingPeriod && g->draggingPeriodIndex == idx;
+
             D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - 24, ry + rowH - 8);
-            if (isCurrent) roundedRect(row, 10, hex(kHyoBlue, 0.16f));
+
+            if (isBeingDragged) {
+                // Soft drop-shadow + bright outline for a "lifted card" feel while dragging.
+                D2D1_RECT_F shadow = D2D1::RectF(row.left + 2, row.top + 5, row.right + 2, row.bottom + 5);
+                roundedRect(shadow, 10, hex(0x000000, 0.30f));
+                roundedRect(row, 10, hex(kHyoBlue, 0.24f));
+                g->renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(row, 10, 10), brush(hex(kHyoBlue, 0.9f)), 2.0f);
+            } else if (isCurrent) {
+                roundedRect(row, 10, hex(kHyoBlue, 0.16f));
+            } else if (isHovered) {
+                // Subtle "raised" hover cue: brighter fill + visible border, signals it's clickable.
+                roundedRect(row, 10, hex(kHyoBlue, 0.09f), &pal.cardBorder);
+            }
 
             float textRight = !g->fullscreen ? row.right - 40 : row.right - 14;
             text(p.label + L" · " + p.subject, D2D1::RectF(row.left + 14, row.top + 6, textRight, row.top + 34),
@@ -514,11 +553,9 @@ void drawFrame(HWND hwnd) {
                 D2D1_RECT_F delBtn = D2D1::RectF(row.right - 32, rowCenterY - 13, row.right - 6, rowCenterY + 13);
                 roundedRect(delBtn, 8, hex(kErrorLight, 0.14f));
                 text(L"", delBtn, g->fmtIcon, hex(kErrorLight), DWRITE_TEXT_ALIGNMENT_CENTER);
-                g->periodDeleteRects.push_back(delBtn);
-            } else {
-                g->periodDeleteRects.push_back(D2D1::RectF(0, 0, 0, 0));
+                g->periodDeleteRects[idx] = delBtn;
             }
-            g->periodRowRects.push_back(row);
+            g->periodRowRects[idx] = row;
 
             ry += rowH;
         }
@@ -675,6 +712,38 @@ void deletePeriodAt(int index) {
     }
 }
 
+// Recomputes the preview slot for the dragged period from the cursor's Y
+// position and moves it within dragOrder — the classic "list shuffles live
+// as you drag" reorder feel, without needing a separately floating card.
+void updatePeriodDragOrder(int cursorY) {
+    if (g->dragOrder.empty() || g->periodRowHeight <= 0) return;
+    int count = (int)g->dragOrder.size();
+    int slot = (int)((cursorY - g->periodListTop) / g->periodRowHeight);
+    slot = std::max(0, std::min(count - 1, slot));
+
+    int curPos = -1;
+    for (int i = 0; i < count; i++) if (g->dragOrder[i] == g->draggingPeriodIndex) { curPos = i; break; }
+    if (curPos == -1 || curPos == slot) return;
+
+    int val = g->dragOrder[curPos];
+    g->dragOrder.erase(g->dragOrder.begin() + curPos);
+    g->dragOrder.insert(g->dragOrder.begin() + slot, val);
+}
+
+void commitPeriodDragReorder() {
+    ExamSchedule* sc = g->scheduleStore.activeMutable();
+    if (sc && g->dragOrder.size() == sc->periods.size()) {
+        std::vector<Period> reordered;
+        reordered.reserve(sc->periods.size());
+        for (int idx : g->dragOrder) reordered.push_back(sc->periods[idx]);
+        sc->periods = std::move(reordered);
+        g->scheduleStore.saveToFile(g->dataPath);
+    }
+    g->isDraggingPeriod = false;
+    g->draggingPeriodIndex = -1;
+    g->dragOrder.clear();
+}
+
 void openNoticeEditor() {
     ExamSchedule* sc = g->scheduleStore.activeMutable();
     std::wstring joined;
@@ -782,24 +851,74 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             for (size_t i = 0; i < g->periodDeleteRects.size() && !handled; i++) {
                 if (ptInRect(pt, g->periodDeleteRects[i])) { deletePeriodAt((int)i); handled = true; }
             }
+            // A period row starts as a "pending click"; WM_MOUSEMOVE promotes it to a
+            // drag once the cursor moves past a small threshold, otherwise WM_LBUTTONUP
+            // treats it as a click and opens the editor.
             for (size_t i = 0; i < g->periodRowRects.size() && !handled; i++) {
-                if (ptInRect(pt, g->periodRowRects[i])) { openPeriodEditor((int)i); handled = true; }
+                if (ptInRect(pt, g->periodRowRects[i])) {
+                    g->pendingIsPeriodClick = true;
+                    g->pendingClickPeriodIndex = (int)i;
+                    g->mouseDownPt = pt;
+                    handled = true;
+                }
             }
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
     case WM_MOUSEMOVE: {
+        POINT pt{ LOWORD(lParam), HIWORD(lParam) };
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
         if (g->draggingSplit) {
-            POINT pt{ LOWORD(lParam), HIWORD(lParam) };
             float ratio = (pt.x - g->contentLeft) / g->contentWidth;
             g->settings.splitRatio = std::max(0.40f, std::min(0.85f, ratio));
             InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (g->pendingIsPeriodClick) {
+            int dx = pt.x - g->mouseDownPt.x, dy = pt.y - g->mouseDownPt.y;
+            if (!g->isDraggingPeriod && (std::abs(dx) > 6 || std::abs(dy) > 6)) {
+                g->isDraggingPeriod = true;
+                g->draggingPeriodIndex = g->pendingClickPeriodIndex;
+                g->dragOrder.resize(g->periodRowRects.size());
+                for (size_t k = 0; k < g->dragOrder.size(); k++) g->dragOrder[k] = (int)k;
+            }
+            if (g->isDraggingPeriod) {
+                updatePeriodDragOrder(pt.y);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        }
+
+        if (!g->fullscreen && !g->isDraggingPeriod) {
+            int newHover = -1;
+            for (size_t i = 0; i < g->periodRowRects.size(); i++) {
+                if (ptInRect(pt, g->periodRowRects[i])) { newHover = (int)i; break; }
+            }
+            if (newHover != g->hoveredPeriodRow) {
+                g->hoveredPeriodRow = newHover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         return 0;
     }
+    case WM_SETCURSOR: {
+        if (LOWORD(lParam) == HTCLIENT) {
+            SetCursor(LoadCursor(nullptr, (g->hoveredPeriodRow != -1 || g->isDraggingPeriod) ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    case WM_MOUSELEAVE:
+        if (g->hoveredPeriodRow != -1) { g->hoveredPeriodRow = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+        return 0;
     case WM_LBUTTONUP:
         if (g->draggingSplit) { g->draggingSplit = false; g->settings.save(); }
+        else if (g->isDraggingPeriod) { commitPeriodDragReorder(); InvalidateRect(hwnd, nullptr, FALSE); }
+        else if (g->pendingIsPeriodClick) { openPeriodEditor(g->pendingClickPeriodIndex); InvalidateRect(hwnd, nullptr, FALSE); }
+        g->pendingIsPeriodClick = false;
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11) toggleFullscreen(hwnd);
