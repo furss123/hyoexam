@@ -101,33 +101,38 @@ static hyo::json::Value dumpSchedule(const ExamSchedule& sc) {
     return v;
 }
 
-bool ScheduleStore::loadFromFile(const std::wstring& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    auto root = hyo::json::parse(ss.str());
-
+void ScheduleStore::fromJson(const hyo::json::Value& root) {
     schedules_.clear();
     for (auto& sv : root["schedules"].arr) {
         schedules_.push_back(parseSchedule(sv));
     }
     activeId_ = utf8ToWide(root["activeId"].asString());
     if (activeId_.empty() && !schedules_.empty()) activeId_ = schedules_[0].id;
-    return true;
 }
 
-bool ScheduleStore::saveToFile(const std::wstring& path) const {
+hyo::json::Value ScheduleStore::toJson() const {
     using namespace hyo::json;
     Value root = Value::makeObject();
     root.set("activeId", Value::makeString(wideToUtf8(activeId_)));
     Value arr = Value::makeArray();
     for (auto& sc : schedules_) arr.arr.push_back(dumpSchedule(sc));
     root.set("schedules", arr);
+    return root;
+}
 
+bool ScheduleStore::loadFromFile(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    fromJson(hyo::json::parse(ss.str()));
+    return true;
+}
+
+bool ScheduleStore::saveToFile(const std::wstring& path) const {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
-    std::string text = hyo::json::dump(root);
+    std::string text = hyo::json::dump(toJson());
     f.write(text.data(), (std::streamsize)text.size());
     return true;
 }

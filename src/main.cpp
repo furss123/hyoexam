@@ -6,12 +6,15 @@
 #include <dwrite.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <ctime>
 #include <cwchar>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 
 #include "schedule.h"
 #include "settings.h"
@@ -20,6 +23,7 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace hyo;
 
@@ -30,13 +34,17 @@ constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
 
-// Native child control IDs (Edit) used for text entry — Direct2D has no
-// text-input widgets of its own, so real typing/Korean IME goes through these.
+// Native child control IDs (Edit/ComboBox) used for text entry — Direct2D has
+// no text-input widgets of its own, so real typing/Korean IME and dropdown
+// selection go through these.
 constexpr int kIdEditLabel = 101;
 constexpr int kIdEditSubject = 102;
-constexpr int kIdEditStart = 103;
-constexpr int kIdEditEnd = 104;
 constexpr int kIdEditNotices = 105;
+constexpr int kIdComboStartHour = 106;
+constexpr int kIdComboStartMinute = 107;
+constexpr int kIdComboEndHour = 108;
+constexpr int kIdComboEndMinute = 109;
+constexpr int kIdEditProfileName = 110;
 
 // Malgun Gothic ships with every Windows 10/11 install (it's the OS's own
 // Korean UI font) — no bundling, no missing-font fallback surprises.
@@ -93,6 +101,15 @@ Palette lightPalette() {
     return p;
 }
 
+// A named, saved snapshot of the whole app: settings (theme/split/time source)
+// plus every exam schedule's full data. Raw JSON values, since this is just
+// stored and restored wholesale, never inspected field-by-field here.
+struct SavedProfile {
+    std::wstring name;
+    hyo::json::Value settingsJson;
+    hyo::json::Value schedulesJson;
+};
+
 // ---- App state ----
 struct AppState {
     ID2D1Factory* d2dFactory = nullptr;
@@ -120,6 +137,10 @@ struct AppState {
     D2D1_RECT_F rectThemeToggle{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
 
+    // Footer site link.
+    D2D1_RECT_F rectSiteLink{};
+    bool hoveredSiteLink = false;
+
     // Time-source dropdown (right of the exam-type buttons).
     D2D1_RECT_F rectTimeSourceButton{};
     bool timeSourceDropdownOpen = false;
@@ -137,7 +158,8 @@ struct AppState {
     std::vector<D2D1_RECT_F> periodDeleteRects;
     D2D1_RECT_F rectAddPeriod{};
     D2D1_RECT_F rectPeriodSave{}, rectPeriodCancel{}, rectPeriodDelete{};
-    D2D1_RECT_F rectFieldLabel{}, rectFieldSubject{}, rectFieldStart{}, rectFieldEnd{};
+    D2D1_RECT_F rectFieldLabel{}, rectFieldSubject{};
+    D2D1_RECT_F rectFieldStartHour{}, rectFieldStartMinute{}, rectFieldEndHour{}, rectFieldEndMinute{};
 
     // Period row hover (click affordance) and drag-to-reorder.
     int hoveredPeriodRow = -1;
@@ -155,8 +177,20 @@ struct AppState {
     D2D1_RECT_F rectNoticeSave{}, rectNoticeCancel{};
     D2D1_RECT_F rectNoticesField{};
 
-    HWND hEditLabel = nullptr, hEditSubject = nullptr, hEditStart = nullptr, hEditEnd = nullptr;
+    // Named profiles: a full snapshot of settings + schedules, saved/loaded as
+    // one unit (not a file picker — an in-app named-slot list).
+    std::vector<SavedProfile> profiles;
+    D2D1_RECT_F rectSaveIcon{}, rectLoadIcon{};
+    bool savingProfile = false;
+    bool loadingProfile = false;
+    D2D1_RECT_F rectProfileNameField{}, rectProfileSaveBtn{}, rectProfileSaveCancel{};
+    D2D1_RECT_F rectProfileLoadClose{};
+    std::vector<D2D1_RECT_F> profileRowRects, profileRowDeleteRects;
+
+    HWND hEditLabel = nullptr, hEditSubject = nullptr;
+    HWND hComboStartHour = nullptr, hComboStartMinute = nullptr, hComboEndHour = nullptr, hComboEndMinute = nullptr;
     HWND hEditNotices = nullptr;
+    HWND hEditProfileName = nullptr;
     HFONT hUiFont = nullptr;
 };
 
@@ -311,11 +345,21 @@ void drawPeriodEditor(D2D1_SIZE_F size) {
     g->rectFieldLabel = field(L"교시명 (예: 1교시)", card.right - pad - x);
     g->rectFieldSubject = field(L"과목 (예: 국어)", card.right - pad - x);
 
-    text(L"시작 (HH:MM)", D2D1::RectF(x, y, x + 180, y + 22), g->fmtSmall, pal.textSecondary);
-    text(L"종료 (HH:MM)", D2D1::RectF(x + 200, y, x + 380, y + 22), g->fmtSmall, pal.textSecondary);
+    // 시:분 드롭다운 두 쌍 (시작/종료) — 자유 텍스트 대신 선택으로 입력 실수 방지.
+    text(L"시작", D2D1::RectF(x, y, x + 156, y + 22), g->fmtSmall, pal.textSecondary);
+    text(L"종료", D2D1::RectF(x + 180, y, x + 336, y + 22), g->fmtSmall, pal.textSecondary);
     y += 26;
-    g->rectFieldStart = D2D1::RectF(x, y, x + 180, y + 34);
-    g->rectFieldEnd = D2D1::RectF(x + 200, y, x + 380, y + 34);
+    float comboW = 70, colonW = 16, groupGap = 24;
+    g->rectFieldStartHour = D2D1::RectF(x, y, x + comboW, y + 34);
+    D2D1_RECT_F colon1 = D2D1::RectF(x + comboW, y, x + comboW + colonW, y + 34);
+    g->rectFieldStartMinute = D2D1::RectF(colon1.right, y, colon1.right + comboW, y + 34);
+    text(L":", colon1, g->fmtBody, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    float x2 = g->rectFieldStartMinute.right + groupGap;
+    g->rectFieldEndHour = D2D1::RectF(x2, y, x2 + comboW, y + 34);
+    D2D1_RECT_F colon2 = D2D1::RectF(x2 + comboW, y, x2 + comboW + colonW, y + 34);
+    g->rectFieldEndMinute = D2D1::RectF(colon2.right, y, colon2.right + comboW, y + 34);
+    text(L":", colon2, g->fmtBody, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     y += 34 + 28;
 
     float btnY = card.bottom - pad - 40;
@@ -400,6 +444,82 @@ void drawTimeSourceDropdown() {
     }
 }
 
+// ---- Save-as-profile popup: one name field, that's the whole interface ----
+void drawSaveProfilePopup(D2D1_SIZE_F size) {
+    Palette pal = currentPalette();
+    g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
+
+    float w = 420, h = 200;
+    D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
+    roundedRect(card, 16, pal.surface, &pal.cardBorder);
+
+    float pad = 28;
+    float x = card.left + pad;
+    float y = card.top + pad;
+    text(L"현재 설정 저장", D2D1::RectF(x, y, card.right - pad, y + 32), g->fmtHeading, pal.textPrimary);
+    y += 48;
+    text(L"저장 이름", D2D1::RectF(x, y, card.right - pad, y + 22), g->fmtSmall, pal.textSecondary);
+    y += 26;
+    g->rectProfileNameField = D2D1::RectF(x, y, card.right - pad, y + 36);
+    y += 36 + 24;
+
+    float btnY = card.bottom - pad - 40;
+    g->rectProfileSaveCancel = D2D1::RectF(card.right - pad - 200, btnY, card.right - pad - 104, btnY + 40);
+    roundedRect(g->rectProfileSaveCancel, 10, hex(0x808080, 0.10f), &pal.cardBorder);
+    text(L"취소", g->rectProfileSaveCancel, g->fmtSmall, pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    g->rectProfileSaveBtn = D2D1::RectF(card.right - pad - 96, btnY, card.right - pad, btnY + 40);
+    roundedRect(g->rectProfileSaveBtn, 10, hex(kHyoBlue, 0.85f));
+    text(L"저장", g->rectProfileSaveBtn, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+
+// ---- Load popup: just a list of saved names, click one to restore it ----
+void drawLoadProfilePopup(D2D1_SIZE_F size) {
+    Palette pal = currentPalette();
+    g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
+
+    float w = 420;
+    float rowH = 52;
+    float listH = g->profiles.empty() ? 60.0f : (float)g->profiles.size() * rowH;
+    float h = 120 + listH;
+    D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
+    roundedRect(card, 16, pal.surface, &pal.cardBorder);
+
+    float pad = 28;
+    float x = card.left + pad;
+    float y = card.top + pad;
+    text(L"저장된 설정 불러오기", D2D1::RectF(x, y, card.right - pad, y + 32), g->fmtHeading, pal.textPrimary);
+    y += 48;
+
+    g->profileRowRects.assign(g->profiles.size(), D2D1::RectF(0, 0, 0, 0));
+    g->profileRowDeleteRects.assign(g->profiles.size(), D2D1::RectF(0, 0, 0, 0));
+
+    if (g->profiles.empty()) {
+        text(L"저장된 항목이 없습니다.", D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtSmall, pal.textTertiary);
+    } else {
+        for (size_t i = 0; i < g->profiles.size(); i++) {
+            D2D1_RECT_F row = D2D1::RectF(x, y, card.right - pad, y + rowH - 10);
+            roundedRect(row, 10, hex(kHyoBlue, 0.08f), &pal.cardBorder);
+            text(g->profiles[i].name, D2D1::RectF(row.left + 14, row.top, row.right - 46, row.bottom),
+                g->fmtBody, pal.textPrimary);
+
+            D2D1_RECT_F delBtn = D2D1::RectF(row.right - 34, row.top + (row.bottom - row.top - 26) / 2,
+                row.right - 8, row.top + (row.bottom - row.top - 26) / 2 + 26);
+            roundedRect(delBtn, 8, hex(kErrorLight, 0.14f));
+            text(L"", delBtn, g->fmtIcon, hex(kErrorLight), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+            g->profileRowRects[i] = row;
+            g->profileRowDeleteRects[i] = delBtn;
+            y += rowH;
+        }
+    }
+
+    float btnY = card.bottom - pad - 40;
+    g->rectProfileLoadClose = D2D1::RectF(card.right - pad - 96, btnY, card.right - pad, btnY + 40);
+    roundedRect(g->rectProfileLoadClose, 10, hex(0x808080, 0.10f), &pal.cardBorder);
+    text(L"닫기", g->rectProfileLoadClose, g->fmtSmall, pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+
 // Shows/hides/positions the native Edit child controls to match whatever
 // Direct2D popup is currently open. Content (SetWindowText) is set once, at the
 // moment a popup opens — this only handles visibility and placement each tick.
@@ -408,17 +528,26 @@ void syncNativeControls() {
     int periodShow = showPeriodFields ? SW_SHOWNA : SW_HIDE;
     ShowWindow(g->hEditLabel, periodShow);
     ShowWindow(g->hEditSubject, periodShow);
-    ShowWindow(g->hEditStart, periodShow);
-    ShowWindow(g->hEditEnd, periodShow);
+    ShowWindow(g->hComboStartHour, periodShow);
+    ShowWindow(g->hComboStartMinute, periodShow);
+    ShowWindow(g->hComboEndHour, periodShow);
+    ShowWindow(g->hComboEndMinute, periodShow);
     if (showPeriodFields) {
         auto place = [](HWND h, D2D1_RECT_F r) {
             SetWindowPos(h, nullptr, (int)r.left, (int)r.top, (int)(r.right - r.left), (int)(r.bottom - r.top),
                 SWP_NOZORDER | SWP_NOACTIVATE);
         };
+        // Dropdown-list combos need extra window height for the popup list itself —
+        // only the top sliver (matching the field rect) shows while closed.
+        auto placeCombo = [](HWND h, D2D1_RECT_F r) {
+            SetWindowPos(h, nullptr, (int)r.left, (int)r.top, (int)(r.right - r.left), 300, SWP_NOZORDER | SWP_NOACTIVATE);
+        };
         place(g->hEditLabel, g->rectFieldLabel);
         place(g->hEditSubject, g->rectFieldSubject);
-        place(g->hEditStart, g->rectFieldStart);
-        place(g->hEditEnd, g->rectFieldEnd);
+        placeCombo(g->hComboStartHour, g->rectFieldStartHour);
+        placeCombo(g->hComboStartMinute, g->rectFieldStartMinute);
+        placeCombo(g->hComboEndHour, g->rectFieldEndHour);
+        placeCombo(g->hComboEndMinute, g->rectFieldEndMinute);
     }
 
     bool showNotices = g->editingNotices;
@@ -427,6 +556,14 @@ void syncNativeControls() {
         SetWindowPos(g->hEditNotices, nullptr, (int)g->rectNoticesField.left, (int)g->rectNoticesField.top,
             (int)(g->rectNoticesField.right - g->rectNoticesField.left),
             (int)(g->rectNoticesField.bottom - g->rectNoticesField.top), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    bool showProfileName = g->savingProfile;
+    ShowWindow(g->hEditProfileName, showProfileName ? SW_SHOWNA : SW_HIDE);
+    if (showProfileName) {
+        SetWindowPos(g->hEditProfileName, nullptr, (int)g->rectProfileNameField.left, (int)g->rectProfileNameField.top,
+            (int)(g->rectProfileNameField.right - g->rectProfileNameField.left),
+            (int)(g->rectProfileNameField.bottom - g->rectProfileNameField.top), SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -477,6 +614,15 @@ void drawFrame(HWND hwnd) {
         g->rectThemeToggle = D2D1::RectF(iconsRight - iconSize * 2 - iconGap, iconTop, iconsRight - iconSize - iconGap, iconTop + iconSize);
         roundedRect(g->rectThemeToggle, 10, hex(kHyoBlue, 0.12f));
         text(isEffectivelyLight() ? L"" : L"", g->rectThemeToggle, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Save / load named profiles, left of the theme toggle.
+        g->rectLoadIcon = D2D1::RectF(iconsRight - iconSize * 3 - iconGap * 2, iconTop, iconsRight - iconSize * 2 - iconGap * 2, iconTop + iconSize);
+        roundedRect(g->rectLoadIcon, 10, hex(kHyoBlue, 0.12f));
+        text(L"", g->rectLoadIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        g->rectSaveIcon = D2D1::RectF(iconsRight - iconSize * 4 - iconGap * 3, iconTop, iconsRight - iconSize * 3 - iconGap * 3, iconTop + iconSize);
+        roundedRect(g->rectSaveIcon, 10, hex(kHyoBlue, 0.12f));
+        text(L"", g->rectSaveIcon, g->fmtIcon, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
         // Left side: exam-type selector (모의고사 / 지필평가).
         g->scheduleButtons.clear();
@@ -653,15 +799,27 @@ void drawFrame(HWND hwnd) {
     }
 
     // Footer / about (verbatim brand format) — windowed/admin view only; the
-    // fullscreen student display stays clean with no small print.
+    // fullscreen student display stays clean with no small print. The site
+    // link is a separate clickable segment so its hit-rect is exact.
     if (!g->fullscreen) {
-        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.  ·  hyot.dev";
-        text(footer, D2D1::RectF(size.width - pad - 480, size.height - pad - 24, size.width - pad, size.height - pad),
+        float footerY = size.height - pad - 24;
+        float footerBottom = size.height - pad;
+
+        g->rectSiteLink = D2D1::RectF(size.width - pad - 78, footerY, size.width - pad, footerBottom);
+        text(L"hyot.dev", D2D1::RectF(g->rectSiteLink.left, footerY, g->rectSiteLink.left + 58, footerBottom),
+            g->fmtVersion, g->hoveredSiteLink ? hex(kHyoBlue) : pal.textTertiary);
+        text(L"", D2D1::RectF(g->rectSiteLink.left + 58, footerY, g->rectSiteLink.right, footerBottom),
+            g->fmtIcon, g->hoveredSiteLink ? hex(kHyoBlue) : pal.textTertiary);
+
+        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.  ·";
+        text(footer, D2D1::RectF(size.width - pad - 480, footerY, g->rectSiteLink.left - 4, footerBottom),
             g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
     if (g->editingNotices) drawNoticeEditor(size);
+    if (g->savingProfile) drawSaveProfilePopup(size);
+    if (g->loadingProfile) drawLoadProfilePopup(size);
     if (g->timeSourceDropdownOpen) drawTimeSourceDropdown();
 
     HRESULT hr = g->renderTarget->EndDraw();
@@ -690,6 +848,8 @@ void toggleFullscreen(HWND hwnd) {
         g->editingNotices = false;
         g->draggingSplit = false;
         g->timeSourceDropdownOpen = false;
+        g->savingProfile = false;
+        g->loadingProfile = false;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g->prevPlacement);
@@ -706,15 +866,6 @@ std::wstring getEditText(HWND h) {
     return s;
 }
 
-TimeOfDay parseTimeInput(const std::wstring& s) {
-    int h = 0, m = 0;
-    swscanf_s(s.c_str(), L"%d:%d", &h, &m);
-    TimeOfDay t;
-    t.hour = std::max(0, std::min(23, h));
-    t.minute = std::max(0, std::min(59, m));
-    return t;
-}
-
 void openPeriodEditor(int index) {
     g->editingPeriodIndex = index;
     ExamSchedule* sc = g->scheduleStore.activeMutable();
@@ -722,13 +873,17 @@ void openPeriodEditor(int index) {
         const Period& p = sc->periods[index];
         SetWindowTextW(g->hEditLabel, p.label.c_str());
         SetWindowTextW(g->hEditSubject, p.subject.c_str());
-        SetWindowTextW(g->hEditStart, p.start.format().c_str());
-        SetWindowTextW(g->hEditEnd, p.end.format().c_str());
+        SendMessage(g->hComboStartHour, CB_SETCURSEL, p.start.hour, 0);
+        SendMessage(g->hComboStartMinute, CB_SETCURSEL, p.start.minute, 0);
+        SendMessage(g->hComboEndHour, CB_SETCURSEL, p.end.hour, 0);
+        SendMessage(g->hComboEndMinute, CB_SETCURSEL, p.end.minute, 0);
     } else {
         SetWindowTextW(g->hEditLabel, L"");
         SetWindowTextW(g->hEditSubject, L"");
-        SetWindowTextW(g->hEditStart, L"");
-        SetWindowTextW(g->hEditEnd, L"");
+        SendMessage(g->hComboStartHour, CB_SETCURSEL, 9, 0);
+        SendMessage(g->hComboStartMinute, CB_SETCURSEL, 0, 0);
+        SendMessage(g->hComboEndHour, CB_SETCURSEL, 9, 0);
+        SendMessage(g->hComboEndMinute, CB_SETCURSEL, 50, 0);
     }
 }
 
@@ -743,8 +898,10 @@ void savePeriodEditor() {
     Period p;
     p.label = getEditText(g->hEditLabel);
     p.subject = getEditText(g->hEditSubject);
-    p.start = parseTimeInput(getEditText(g->hEditStart));
-    p.end = parseTimeInput(getEditText(g->hEditEnd));
+    p.start.hour = (int)SendMessage(g->hComboStartHour, CB_GETCURSEL, 0, 0);
+    p.start.minute = (int)SendMessage(g->hComboStartMinute, CB_GETCURSEL, 0, 0);
+    p.end.hour = (int)SendMessage(g->hComboEndHour, CB_GETCURSEL, 0, 0);
+    p.end.minute = (int)SendMessage(g->hComboEndMinute, CB_GETCURSEL, 0, 0);
     p.durationMinutes = std::max(0, p.end.totalMinutes() - p.start.totalMinutes());
 
     if (g->editingPeriodIndex == -2) {
@@ -839,6 +996,118 @@ void saveNoticeEditor() {
     g->editingNotices = false;
 }
 
+// ---- Named profiles (save/load everything as one named snapshot) ----
+
+std::wstring utf8ToWideMain(const std::string& s) {
+    if (s.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring out(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), len);
+    return out;
+}
+
+std::string wideToUtf8Main(const std::wstring& s) {
+    if (s.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+std::wstring profilesFilePath() {
+    PWSTR appData = nullptr;
+    std::wstring dir = L".";
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) {
+        dir = appData;
+        CoTaskMemFree(appData);
+    }
+    dir += L"\\HyoExam";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\profiles.json";
+}
+
+void loadProfilesFromDisk() {
+    g->profiles.clear();
+    std::ifstream f(profilesFilePath(), std::ios::binary);
+    if (!f) return;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    auto root = hyo::json::parse(ss.str());
+    for (auto& pv : root["profiles"].arr) {
+        SavedProfile sp;
+        sp.name = utf8ToWideMain(pv["name"].asString());
+        sp.settingsJson = pv["settings"];
+        sp.schedulesJson = pv["schedules"];
+        g->profiles.push_back(sp);
+    }
+}
+
+void saveProfilesToDisk() {
+    using namespace hyo::json;
+    Value root = Value::makeObject();
+    Value arr = Value::makeArray();
+    for (auto& sp : g->profiles) {
+        Value pv = Value::makeObject();
+        pv.set("name", Value::makeString(wideToUtf8Main(sp.name)));
+        pv.set("settings", sp.settingsJson);
+        pv.set("schedules", sp.schedulesJson);
+        arr.arr.push_back(pv);
+    }
+    root.set("profiles", arr);
+    std::ofstream f(profilesFilePath(), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    std::string text = hyo::json::dump(root);
+    f.write(text.data(), (std::streamsize)text.size());
+}
+
+hyo::json::Value buildSettingsSnapshotJson() {
+    using namespace hyo::json;
+    Value v = Value::makeObject();
+    v.set("theme", Value::makeString(g->settings.theme == Theme::Light ? "light" : g->settings.theme == Theme::Dark ? "dark" : "auto"));
+    v.set("splitRatio", Value::makeNumber(g->settings.splitRatio));
+    v.set("timeSourceIndex", Value::makeNumber(g->settings.timeSourceIndex));
+    return v;
+}
+
+void applySettingsSnapshotJson(const hyo::json::Value& v) {
+    std::string themeStr = v["theme"].asString("auto");
+    g->settings.theme = themeStr == "light" ? Theme::Light : themeStr == "dark" ? Theme::Dark : Theme::Auto;
+    g->settings.splitRatio = (float)v["splitRatio"].asNumber(0.70);
+    g->settings.timeSourceIndex = (int)v["timeSourceIndex"].asNumber(0);
+    if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
+}
+
+void saveCurrentAsProfile(const std::wstring& name) {
+    if (name.empty()) return;
+    SavedProfile sp;
+    sp.name = name;
+    sp.settingsJson = buildSettingsSnapshotJson();
+    sp.schedulesJson = g->scheduleStore.toJson();
+
+    bool replaced = false;
+    for (auto& existing : g->profiles) {
+        if (existing.name == name) { existing = sp; replaced = true; break; }
+    }
+    if (!replaced) g->profiles.push_back(sp);
+    saveProfilesToDisk();
+}
+
+void loadProfileByIndex(int idx) {
+    if (idx < 0 || idx >= (int)g->profiles.size()) return;
+    SavedProfile& sp = g->profiles[idx];
+    applySettingsSnapshotJson(sp.settingsJson);
+    g->scheduleStore.fromJson(sp.schedulesJson);
+    g->settings.save();
+    g->scheduleStore.saveToFile(g->dataPath);
+    g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);
+}
+
+void deleteProfileAt(int idx) {
+    if (idx < 0 || idx >= (int)g->profiles.size()) return;
+    g->profiles.erase(g->profiles.begin() + idx);
+    saveProfilesToDisk();
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -857,9 +1126,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         };
         g->hEditLabel = makeEdit(kIdEditLabel, ES_AUTOHSCROLL);
         g->hEditSubject = makeEdit(kIdEditSubject, ES_AUTOHSCROLL);
-        g->hEditStart = makeEdit(kIdEditStart, ES_AUTOHSCROLL);
-        g->hEditEnd = makeEdit(kIdEditEnd, ES_AUTOHSCROLL);
         g->hEditNotices = makeEdit(kIdEditNotices, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL);
+        g->hEditProfileName = makeEdit(kIdEditProfileName, ES_AUTOHSCROLL);
+
+        auto makeCombo = [&](int id, int itemCount) {
+            HWND h = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)id, hInst, nullptr);
+            SendMessage(h, WM_SETFONT, (WPARAM)g->hUiFont, TRUE);
+            wchar_t buf[4];
+            for (int i = 0; i < itemCount; i++) {
+                swprintf(buf, 4, L"%02d", i);
+                SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)buf);
+            }
+            return h;
+        };
+        g->hComboStartHour = makeCombo(kIdComboStartHour, 24);
+        g->hComboStartMinute = makeCombo(kIdComboStartMinute, 60);
+        g->hComboEndHour = makeCombo(kIdComboEndHour, 24);
+        g->hComboEndMinute = makeCombo(kIdComboEndMinute, 60);
 
         return 0;
     }
@@ -868,7 +1152,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // full-surface present on every repaint fights the child Edit control's own
         // paint and blanks out whatever the user just typed. The explicit
         // InvalidateRect calls around each click already cover state changes.
-        if (g->editingPeriodIndex == -1 && !g->editingNotices) {
+        if (g->editingPeriodIndex == -1 && !g->editingNotices && !g->savingProfile) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -895,6 +1179,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (g->editingNotices) {
             if (ptInRect(pt, g->rectNoticeSave)) saveNoticeEditor();
             else if (ptInRect(pt, g->rectNoticeCancel)) g->editingNotices = false;
+        } else if (g->savingProfile) {
+            if (ptInRect(pt, g->rectProfileSaveBtn)) {
+                saveCurrentAsProfile(getEditText(g->hEditProfileName));
+                g->savingProfile = false;
+            } else if (ptInRect(pt, g->rectProfileSaveCancel)) {
+                g->savingProfile = false;
+            }
+        } else if (g->loadingProfile) {
+            if (ptInRect(pt, g->rectProfileLoadClose)) {
+                g->loadingProfile = false;
+            } else {
+                bool handled = false;
+                for (size_t i = 0; i < g->profileRowDeleteRects.size() && !handled; i++) {
+                    if (ptInRect(pt, g->profileRowDeleteRects[i])) { deleteProfileAt((int)i); handled = true; }
+                }
+                for (size_t i = 0; i < g->profileRowRects.size() && !handled; i++) {
+                    if (ptInRect(pt, g->profileRowRects[i])) { loadProfileByIndex((int)i); g->loadingProfile = false; handled = true; }
+                }
+            }
+        } else if (ptInRect(pt, g->rectSaveIcon)) {
+            g->savingProfile = true;
+            SetWindowTextW(g->hEditProfileName, L"");
+        } else if (ptInRect(pt, g->rectLoadIcon)) {
+            g->loadingProfile = true;
         } else if (g->timeSourceDropdownOpen) {
             for (int i = 0; i < kTimeSourceCount; i++) {
                 if (ptInRect(pt, g->timeSourceOptionRects[i])) {
@@ -907,6 +1215,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g->timeSourceDropdownOpen = false;
         } else if (ptInRect(pt, g->rectTimeSourceButton)) {
             g->timeSourceDropdownOpen = true;
+        } else if (!g->fullscreen && ptInRect(pt, g->rectSiteLink)) {
+            ShellExecuteW(nullptr, L"open", L"https://hyot.dev", nullptr, nullptr, SW_SHOWNORMAL);
         } else if (ptInRect(pt, g->rectFullscreenBtn)) {
             toggleFullscreen(hwnd);
         } else if (ptInRect(pt, g->rectThemeToggle)) {
@@ -988,17 +1298,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
+
+        {
+            bool nowHovered = !g->fullscreen && ptInRect(pt, g->rectSiteLink);
+            if (nowHovered != g->hoveredSiteLink) {
+                g->hoveredSiteLink = nowHovered;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
         return 0;
     }
     case WM_SETCURSOR: {
         if (LOWORD(lParam) == HTCLIENT) {
-            SetCursor(LoadCursor(nullptr, (g->hoveredPeriodRow != -1 || g->isDraggingPeriod) ? IDC_HAND : IDC_ARROW));
+            SetCursor(LoadCursor(nullptr, (g->hoveredPeriodRow != -1 || g->isDraggingPeriod || g->hoveredSiteLink) ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     case WM_MOUSELEAVE:
         if (g->hoveredPeriodRow != -1) { g->hoveredPeriodRow = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+        if (g->hoveredSiteLink) { g->hoveredSiteLink = false; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     case WM_LBUTTONUP:
         if (g->draggingSplit) { g->draggingSplit = false; g->settings.save(); }
@@ -1010,6 +1329,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == VK_F11) toggleFullscreen(hwnd);
         else if (wParam == VK_ESCAPE && g->editingPeriodIndex != -1) { closePeriodEditor(); InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->editingNotices) { g->editingNotices = false; InvalidateRect(hwnd, nullptr, FALSE); }
+        else if (wParam == VK_ESCAPE && g->savingProfile) { g->savingProfile = false; InvalidateRect(hwnd, nullptr, FALSE); }
+        else if (wParam == VK_ESCAPE && g->loadingProfile) { g->loadingProfile = false; InvalidateRect(hwnd, nullptr, FALSE); }
         else if (wParam == VK_ESCAPE && g->fullscreen) { toggleFullscreen(hwnd); }
         return 0;
     case WM_DESTROY:
@@ -1030,6 +1351,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     g->dataPath = wideExeDir() + L"\\data\\schedules.json";
     g->scheduleStore.loadFromFile(g->dataPath);
     if (!g->settings.activeScheduleId.empty()) g->scheduleStore.setActive(g->settings.activeScheduleId);
+    loadProfilesFromDisk();
 
     if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
     g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include "json.hpp"
 
 namespace hyo {
 
@@ -53,6 +54,11 @@ public:
         for (auto& sc : schedules_) if (sc.id == activeId_) return &sc;
         return schedules_.empty() ? nullptr : &schedules_[0];
     }
+
+    // In-memory (de)serialization, shared by loadFromFile/saveToFile and by the
+    // named-profile save/load feature which snapshots the whole store.
+    json::Value toJson() const;
+    void fromJson(const json::Value& root);
 
 private:
     std::vector<ExamSchedule> schedules_;
