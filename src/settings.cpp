@@ -46,7 +46,6 @@ bool Settings::load() {
 
     std::string themeStr = root["theme"].asString("dark");
     theme = themeStr == "light" ? Theme::Light : themeStr == "auto" ? Theme::Auto : Theme::Dark;
-    glassOpacity = (float)root["glassOpacity"].asNumber(0.85);
     fontScale = (float)root["fontScale"].asNumber(1.0);
     activeScheduleId = utf8ToWide(root["activeScheduleId"].asString());
     return true;
@@ -56,7 +55,6 @@ bool Settings::save() const {
     using namespace hyo::json;
     Value root = Value::makeObject();
     root.set("theme", Value::makeString(theme == Theme::Light ? "light" : theme == Theme::Auto ? "auto" : "dark"));
-    root.set("glassOpacity", Value::makeNumber(glassOpacity));
     root.set("fontScale", Value::makeNumber(fontScale));
     root.set("activeScheduleId", Value::makeString(wideToUtf8(activeScheduleId)));
 

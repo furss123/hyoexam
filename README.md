@@ -34,8 +34,8 @@ cmake --build build
 - `data/schedules.json` — 시험 유형별 교시/시간/과목/쉬는시간/안내문구.
   구조는 파일 내 `mock_exam`(모의고사), `midterm`(내신) 예시 참고. 학교마다
   시간표가 다르므로 각 학교에 맞게 직접 수정.
-- `%APPDATA%\HyoExam\settings.json` — 테마·글래스 불투명도·마지막 선택
-  시험 유형 (앱이 자동 생성/저장).
+- `%APPDATA%\HyoExam\settings.json` — 테마·마지막 선택 시험 유형
+  (앱이 자동 생성/저장).
 
 ## 브랜드 자산
 

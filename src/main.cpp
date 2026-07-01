@@ -96,8 +96,6 @@ struct AppState {
     D2D1_RECT_F rectGear{};
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
     D2D1_RECT_F rectThemeDark{}, rectThemeLight{}, rectThemeAuto{};
-    D2D1_RECT_F rectOpacityTrack{};
-    bool draggingOpacity = false;
 };
 
 AppState* g = nullptr;
@@ -193,7 +191,7 @@ void drawSettingsModal(D2D1_SIZE_F size) {
     Palette pal = currentPalette();
     g->renderTarget->FillRectangle(D2D1::RectF(0, 0, size.width, size.height), brush(hex(0x000000, 0.55f)));
 
-    float w = 640, h = 560;
+    float w = 640, h = 420;
     D2D1_RECT_F card = D2D1::RectF((size.width - w) / 2, (size.height - h) / 2, (size.width + w) / 2, (size.height + h) / 2);
     roundedRect(card, 16, pal.surface, &pal.cardBorder);
 
@@ -238,24 +236,6 @@ void drawSettingsModal(D2D1_SIZE_F size) {
     g->rectThemeDark = themeBtn(x, L"다크", Theme::Dark);
     g->rectThemeLight = themeBtn(x + 132, L"라이트", Theme::Light);
     g->rectThemeAuto = themeBtn(x + 264, L"자동", Theme::Auto);
-    y += 40 + 28;
-
-    // Section: glass opacity
-    wchar_t opLabel[64];
-    swprintf(opLabel, 64, L"글래스 불투명도  (%d%%)", (int)(g->settings.glassOpacity * 100));
-    text(opLabel, D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtBody, pal.textSecondary);
-    y += 34;
-    g->rectOpacityTrack = D2D1::RectF(x, y + 14, card.right - pad, y + 22);
-    roundedRect(g->rectOpacityTrack, 4, hex(0x808080, 0.15f));
-    float knobX = g->rectOpacityTrack.left + g->settings.glassOpacity * (g->rectOpacityTrack.right - g->rectOpacityTrack.left);
-    g->renderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, y + 18), 9, 9), brush(hex(kHyoBlue)));
-    y += 40 + 20;
-
-    // Section: data
-    text(L"데이터", D2D1::RectF(x, y, card.right - pad, y + 26), g->fmtBody, pal.textSecondary);
-    y += 34;
-    text(L"schedules.json / settings.json 은 %APPDATA%\\HyoExam 폴더에 저장됩니다.",
-        D2D1::RectF(x, y, card.right - pad, y + 44), g->fmtSmall, pal.textTertiary);
 
     text(L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.",
         D2D1::RectF(x, card.bottom - pad - 20, card.right - pad, card.bottom - pad), g->fmtVersion, pal.textTertiary);
@@ -432,11 +412,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (ptInRect(pt, g->rectThemeDark)) { g->settings.theme = Theme::Dark; g->settings.save(); }
             else if (ptInRect(pt, g->rectThemeLight)) { g->settings.theme = Theme::Light; g->settings.save(); }
             else if (ptInRect(pt, g->rectThemeAuto)) { g->settings.theme = Theme::Auto; g->settings.save(); }
-            else if (ptInRect(pt, g->rectOpacityTrack)) {
-                g->draggingOpacity = true;
-                float ratio = (pt.x - g->rectOpacityTrack.left) / (g->rectOpacityTrack.right - g->rectOpacityTrack.left);
-                g->settings.glassOpacity = std::max(0.0f, std::min(1.0f, ratio));
-            } else {
+            else {
                 for (auto& [r, id] : g->scheduleButtons) {
                     if (ptInRect(pt, r)) { g->scheduleStore.setActive(id); g->settings.activeScheduleId = id; g->settings.save(); break; }
                 }
@@ -447,18 +423,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
-    case WM_MOUSEMOVE: {
-        if (g->draggingOpacity) {
-            POINT pt{ LOWORD(lParam), HIWORD(lParam) };
-            float ratio = (pt.x - g->rectOpacityTrack.left) / (g->rectOpacityTrack.right - g->rectOpacityTrack.left);
-            g->settings.glassOpacity = std::max(0.0f, std::min(1.0f, ratio));
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-    }
-    case WM_LBUTTONUP:
-        if (g->draggingOpacity) { g->draggingOpacity = false; g->settings.save(); }
-        return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11) toggleFullscreen(hwnd);
         else if (wParam == VK_ESCAPE && g->settingsOpen) { g->settingsOpen = false; g->settings.save(); InvalidateRect(hwnd, nullptr, FALSE); }
