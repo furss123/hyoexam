@@ -13,6 +13,10 @@ struct Settings {
     float fontScale = 1.0f;       // 0.8..1.5
     int timeSourceIndex = 0;      // index into kTimeSources (main.cpp)
     std::wstring activeScheduleId;
+    // Fullscreen display toggles -- the clock is always shown; these two are
+    // opt-in extras (default on, so upgrading keeps today's full display).
+    bool fullscreenShowSchedule = true;
+    bool fullscreenShowMemo = true;
 
     static std::wstring settingsPath();
     bool load();

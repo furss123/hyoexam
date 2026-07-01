@@ -11,7 +11,7 @@
 namespace hyo {
 
 namespace {
-    constexpr auto kSyncInterval = std::chrono::seconds(10);
+    constexpr auto kSyncInterval = std::chrono::seconds(1);
     constexpr DWORD kRequestTimeoutMs = 3000;
     constexpr double kNtpToUnixEpochSeconds = 2208988800.0;   // 1900 -> 1970
     constexpr double kUnixToFileTimeEpochSeconds = 11644473600.0; // 1970 -> 1601
@@ -40,6 +40,14 @@ std::wstring TimeSync::currentHost() {
 
 void TimeSync::start() {
     if (running_.exchange(true)) return;
+    // One blocking fetch before the background loop starts, so the app opens
+    // already synced instead of showing "동기화 대기중" for the first tick.
+    // Bounded by kRequestTimeoutMs (3s) on failure/no network.
+    long long offset = 0;
+    if (fetchSntpOffset(currentHost(), offset)) {
+        offsetMs_.store(offset, std::memory_order_relaxed);
+        synced_.store(true, std::memory_order_relaxed);
+    }
     worker_ = std::thread([this] { run(); });
 }
 

@@ -62,6 +62,16 @@ const TimeSourceOption kTimeSources[] = {
 };
 constexpr int kTimeSourceCount = (int)(sizeof(kTimeSources) / sizeof(kTimeSources[0]));
 
+// Curated set for the memo's emoji picker -- school/exam-day relevant only,
+// deliberately not the full OS emoji panel (which has no content filtering).
+const wchar_t* kSchoolEmojis[] = {
+    L"📚", L"✏", L"📝", L"📖", L"🎓",
+    L"⏰", L"✅", L"❌", L"⭐", L"📌",
+    L"🔔", L"📢", L"💯", L"👍", L"😊",
+    L"🎉", L"📅", L"❗", L"❓", L"💡",
+};
+constexpr int kSchoolEmojiCount = (int)(sizeof(kSchoolEmojis) / sizeof(kSchoolEmojis[0]));
+
 // ---- Brand palette (HyoT-brand-kit.md — do not introduce new hues) ----
 struct Palette {
     D2D1_COLOR_F base, surface, cardBorder;
@@ -131,6 +141,7 @@ struct AppState {
     IDWriteTextFormat* fmtHeading = nullptr;
     IDWriteTextFormat* fmtBody = nullptr;
     IDWriteTextFormat* fmtSmall = nullptr;
+    IDWriteTextFormat* fmtSmallBold = nullptr; // memo toolbar's "가" (Bold) icon glyph
     IDWriteTextFormat* fmtVersion = nullptr;
     IDWriteTextFormat* fmtIcon = nullptr;      // inline glyphs (footer link arrow, dropdown chevron)
     IDWriteTextFormat* fmtIconBox = nullptr;   // larger glyphs inside boxed icon buttons (save/load/theme/fullscreen/delete)
@@ -181,6 +192,13 @@ struct AppState {
     D2D1_RECT_F timeSourceOptionRects[kTimeSourceCount]{};
     int hoveredTimeSourceOption = -1;
 
+    // Fullscreen display-toggle dropdown (right of the time-source dropdown) --
+    // the clock is always shown in fullscreen; these two checkboxes opt in the
+    // schedule panel and the memo card independently.
+    D2D1_RECT_F rectDisplaySettingsButton{};
+    bool displaySettingsOpen = false;
+    D2D1_RECT_F rectDisplayScheduleRow{}, rectDisplayMemoRow{};
+
 
     // Timetable editing.
     int editingPeriodIndex = -1; // -1 = closed, -2 = new period, >=0 = editing that index
@@ -230,6 +248,8 @@ struct AppState {
     D2D1_RECT_F rectMemoAlignLeft{}, rectMemoAlignCenter{}, rectMemoAlignRight{};
     bool memoBoldActive = false, memoUnderlineActive = false;
     WORD memoAlign = PFA_LEFT;
+    bool memoEmojiPickerOpen = false;
+    D2D1_RECT_F memoEmojiRects[kSchoolEmojiCount]{};
     COLORREF memoCustomColors[16]{}; // persists the ChooseColor "custom colors" row across both pickers
 
     HWND hEditLabel = nullptr, hEditSubject = nullptr;
@@ -294,6 +314,7 @@ void buildFonts() {
     if (g->fmtHeading) g->fmtHeading->Release();
     if (g->fmtBody) g->fmtBody->Release();
     if (g->fmtSmall) g->fmtSmall->Release();
+    if (g->fmtSmallBold) g->fmtSmallBold->Release();
 
     const wchar_t* family = kUiFontFamily;
     g->fmtClock = makeFormat(family, 150.0f, DWRITE_FONT_WEIGHT_BOLD);
@@ -301,6 +322,7 @@ void buildFonts() {
     g->fmtHeading = makeFormat(family, 22.0f, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtBody = makeFormat(family, 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmall = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    g->fmtSmallBold = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_BOLD); // memo toolbar's "가" (Bold) icon
     g->fmtClock->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     // Headings are single-line titles — clip rather than wrap-and-overlap the row below
     // when the window gets narrow (e.g. windowed edit mode at a small size).
@@ -514,6 +536,53 @@ void drawTimeSourceDropdown() {
         D2D1_RECT_F tip = D2D1::RectF(card.right + 10, row.top, card.right + 10 + tipW, row.top + rowH - 4);
         roundedRect(tip, 8, pal.surface, &pal.cardBorder);
         text(desc, D2D1::RectF(tip.left + 12, tip.top, tip.right - 12, tip.bottom), g->fmtVersion, pal.textSecondary);
+    }
+}
+
+// ---- Fullscreen display toggles: clock is always on, schedule/memo opt in ----
+void drawDisplaySettingsDropdown() {
+    Palette pal = currentPalette();
+    float rowH = 44;
+    float w = 220;
+    D2D1_RECT_F card = D2D1::RectF(g->rectDisplaySettingsButton.left, g->rectDisplaySettingsButton.bottom + 6,
+        g->rectDisplaySettingsButton.left + w, g->rectDisplaySettingsButton.bottom + 6 + rowH * 2);
+    roundedRect(card, 12, pal.surface, &pal.cardBorder);
+
+    auto checkRow = [&](int i, const wchar_t* label, bool checked, D2D1_RECT_F& outRow) {
+        D2D1_RECT_F row = D2D1::RectF(card.left + 6, card.top + 6 + i * rowH, card.right - 6, card.top + 6 + (i + 1) * rowH - 4);
+        outRow = row;
+        D2D1_RECT_F box = D2D1::RectF(row.left + 8, row.top + (row.bottom - row.top - 20) / 2,
+            row.left + 28, row.top + (row.bottom - row.top - 20) / 2 + 20);
+        roundedRect(box, 5, checked ? hex(kHyoBlue, 0.85f) : hex(kHyoBlue, 0.10f), checked ? nullptr : &pal.cardBorder);
+        if (checked) text(L"✓", box, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(label, D2D1::RectF(box.right + 10, row.top, row.right - 8, row.bottom), g->fmtSmall, pal.textPrimary);
+    };
+    checkRow(0, L"교시/과목 표시", g->settings.fullscreenShowSchedule, g->rectDisplayScheduleRow);
+    checkRow(1, L"메모 표시", g->settings.fullscreenShowMemo, g->rectDisplayMemoRow);
+}
+
+// ---- Curated emoji grid for the memo (school-appropriate subset only) ----
+void drawMemoEmojiPicker() {
+    Palette pal = currentPalette();
+    constexpr int kCols = 5;
+    constexpr int kRows = (kSchoolEmojiCount + kCols - 1) / kCols;
+    float cell = 40, cellGap = 4, pad = 8;
+    float w = kCols * cell + (kCols - 1) * cellGap + pad * 2;
+    float h = kRows * cell + (kRows - 1) * cellGap + pad * 2;
+    // Opens upward, not downward: the memo toolbar sits near the bottom of the
+    // screen, so a downward popup would overflow past the window's bottom edge.
+    D2D1_RECT_F card = D2D1::RectF(g->rectMemoEmoji.left, g->rectMemoEmoji.top - h - 6,
+        g->rectMemoEmoji.left + w, g->rectMemoEmoji.top - 6);
+    roundedRect(card, 12, pal.surface, &pal.cardBorder);
+
+    for (int i = 0; i < kSchoolEmojiCount; i++) {
+        int col = i % kCols, row = i / kCols;
+        D2D1_RECT_F cellRect = D2D1::RectF(
+            card.left + pad + col * (cell + cellGap), card.top + pad + row * (cell + cellGap),
+            card.left + pad + col * (cell + cellGap) + cell, card.top + pad + row * (cell + cellGap) + cell);
+        roundedRect(cellRect, 8, hex(kHyoBlue, 0.08f));
+        text(kSchoolEmojis[i], cellRect, g->fmtBody, pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+        g->memoEmojiRects[i] = cellRect;
     }
 }
 
@@ -814,18 +883,11 @@ void pickMemoColor(bool background) {
     SetFocus(g->hRichMemo);
 }
 
-// Opens the built-in Windows 10/11 emoji panel (the same one Win+. opens
-// anywhere) with the memo focused, so picking an emoji inserts it at the
-// caret. There's no public API to open it directly; simulating the shortcut
-// on a focused text field is the standard/only way to trigger it.
-void openMemoEmojiPicker() {
+// Inserts one curated emoji at the current selection/caret. Same-process
+// EM_REPLACESEL call, no marshaling concerns.
+void insertMemoEmoji(const wchar_t* emoji) {
+    SendMessageW(g->hRichMemo, EM_REPLACESEL, TRUE, (LPARAM)emoji);
     SetFocus(g->hRichMemo);
-    INPUT in[4] = {};
-    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_LWIN;
-    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_OEM_PERIOD;
-    in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = VK_OEM_PERIOD; in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_LWIN; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(4, in, sizeof(INPUT));
 }
 
 // Canvas background follows the theme, and so does the *default* text color
@@ -943,6 +1005,16 @@ void drawFrame(HWND hwnd) {
         text(L"", D2D1::RectF(g->rectTimeSourceButton.right - 26, g->rectTimeSourceButton.top,
                 g->rectTimeSourceButton.right - 4, g->rectTimeSourceButton.bottom),
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Fullscreen display-toggle button, right after the time-source dropdown.
+        bx += dropdownW + iconGap;
+        float displayBtnW = 88;
+        g->rectDisplaySettingsButton = D2D1::RectF(bx, iconTop, bx + displayBtnW, iconTop + iconSize);
+        roundedRect(g->rectDisplaySettingsButton, 10,
+            g->displaySettingsOpen ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f),
+            g->displaySettingsOpen ? nullptr : &pal.cardBorder);
+        text(L"표시", g->rectDisplaySettingsButton, g->fmtSmall,
+            g->displaySettingsOpen ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         // Fullscreen still exposes one unobtrusive "return to window" icon,
         // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
@@ -960,23 +1032,42 @@ void drawFrame(HWND hwnd) {
         g->scheduleButtons.clear();
         g->rectTimeSourceButton = D2D1::RectF(0, 0, 0, 0);
         g->timeSourceDropdownOpen = false;
+        g->rectDisplaySettingsButton = D2D1::RectF(0, 0, 0, 0);
+        g->displaySettingsOpen = false;
     }
 
     // Left column: clock (+ memo below it). Right column: today's period
     // timetable. Fixed split (60/40) tuned for TV/projector signage -- no
-    // longer drags/persists per-user.
+    // longer drags/persists per-user. In fullscreen the clock is always shown;
+    // the schedule panel and memo card are independently opt-in (표시 dropdown)
+    // -- when one is off, the other side/dimension simply expands to fill it.
+    bool showSchedule = !g->fullscreen || g->settings.fullscreenShowSchedule;
+    bool showMemo = !g->fullscreen || g->settings.fullscreenShowMemo;
+
     constexpr float kClockPanelRatio = 0.60f;
     float totalWidth = content.right - content.left;
-    float leftWidth = totalWidth * kClockPanelRatio - gap / 2;
-    D2D1_RECT_F leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
-    D2D1_RECT_F rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
+    D2D1_RECT_F leftCard, rightCard;
+    if (showSchedule) {
+        float leftWidth = totalWidth * kClockPanelRatio - gap / 2;
+        leftCard = D2D1::RectF(content.left, content.top, content.left + leftWidth, content.bottom);
+        rightCard = D2D1::RectF(leftCard.right + gap, content.top, content.right, content.bottom);
+    } else {
+        leftCard = content;
+        rightCard = D2D1::RectF(0, 0, 0, 0);
+    }
 
     // Clock card on top, free-write memo card below it -- fixed 70/30 vertical split.
     constexpr float kClockVerticalRatio = 0.70f;
-    float leftHeight = leftCard.bottom - leftCard.top;
-    float clockCardH = leftHeight * kClockVerticalRatio - gap / 2;
-    D2D1_RECT_F clockCard = D2D1::RectF(leftCard.left, leftCard.top, leftCard.right, leftCard.top + clockCardH);
-    D2D1_RECT_F memoCard = D2D1::RectF(leftCard.left, clockCard.bottom + gap, leftCard.right, leftCard.bottom);
+    D2D1_RECT_F clockCard, memoCard;
+    if (showMemo) {
+        float leftHeight = leftCard.bottom - leftCard.top;
+        float clockCardH = leftHeight * kClockVerticalRatio - gap / 2;
+        clockCard = D2D1::RectF(leftCard.left, leftCard.top, leftCard.right, leftCard.top + clockCardH);
+        memoCard = D2D1::RectF(leftCard.left, clockCard.bottom + gap, leftCard.right, leftCard.bottom);
+    } else {
+        clockCard = leftCard;
+        memoCard = D2D1::RectF(0, 0, 0, 0);
+    }
 
     // The height-only pass in buildFullscreenFonts() can size the clock too wide
     // for narrower card ratios / aspect ratios (it doesn't know the card width
@@ -1033,8 +1124,8 @@ void drawFrame(HWND hwnd) {
         fClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // ---- Memo card (free-write area under the clock) ----
-    roundedRect(memoCard, 16, pal.surface, &pal.cardBorder);
-    {
+    if (showMemo) {
+        roundedRect(memoCard, 16, pal.surface, &pal.cardBorder);
         float mx = memoCard.left + cardPad * 0.6f;
         float toolbarH = g->fullscreen ? 0.0f : 44.0f;
         if (!g->fullscreen) {
@@ -1042,22 +1133,53 @@ void drawFrame(HWND hwnd) {
             float btn = 32, btnGap = 8;
             float by = memoCard.top + (toolbarH - btn) / 2.0f;
             float bx = mx;
-            auto memoBtn = [&](D2D1_RECT_F& rect, const wchar_t* label, bool active, D2D1_COLOR_F fg) {
+            // Icon language modeled on 한글(HWP)'s "글자 모양" toolbar: a "가"
+            // glyph carries the weight/underline/color cue directly (bold
+            // weight, underline stroke, color bar) instead of English-letter
+            // buttons, and alignment is 3 bars in the actual left/center/right
+            // position rather than "L"/"C"/"R" text.
+            auto memoBtnBox = [&](D2D1_RECT_F& rect, bool active) -> D2D1_RECT_F {
                 rect = D2D1::RectF(bx, by, bx + btn, by + btn);
                 roundedRect(rect, 8, active ? hex(kHyoBlue, 0.30f) : hex(kHyoBlue, 0.10f));
-                text(label, rect, g->fmtSmall, fg, DWRITE_TEXT_ALIGNMENT_CENTER);
                 bx += btn + btnGap;
+                return rect;
             };
-            memoBtn(g->rectMemoBold, L"B", g->memoBoldActive, hex(kHyoBlue));
-            memoBtn(g->rectMemoUnderline, L"U", g->memoUnderlineActive, hex(kHyoBlue));
-            memoBtn(g->rectMemoAlignLeft, L"L", g->memoAlign == PFA_LEFT, hex(kHyoBlue));
-            memoBtn(g->rectMemoAlignCenter, L"C", g->memoAlign == PFA_CENTER, hex(kHyoBlue));
-            memoBtn(g->rectMemoAlignRight, L"R", g->memoAlign == PFA_RIGHT, hex(kHyoBlue));
-            memoBtn(g->rectMemoSizeDown, L"A-", false, hex(kHyoBlue));
-            memoBtn(g->rectMemoSizeUp, L"A+", false, hex(kHyoBlue));
-            memoBtn(g->rectMemoFontColor, L"가", false, hex(kHyoBlue));
-            memoBtn(g->rectMemoBgColor, L"■", false, hex(kOrange));
-            memoBtn(g->rectMemoEmoji, L"🙂", false, hex(kHyoBlue));
+            auto drawAlignBars = [&](D2D1_RECT_F r, WORD mode) {
+                float barH = 3, rowGap = 4;
+                float fullW = (r.right - r.left) - 12;
+                float shortW = fullW * 0.6f;
+                float y = r.top + ((r.bottom - r.top) - (barH * 3 + rowGap * 2)) / 2.0f;
+                for (int line = 0; line < 3; line++) {
+                    float w = (line == 1) ? shortW : fullW;
+                    float x = mode == PFA_LEFT ? r.left + 6
+                        : mode == PFA_RIGHT ? r.right - 6 - w
+                        : r.left + 6 + (fullW - w) / 2.0f;
+                    roundedRect(D2D1::RectF(x, y, x + w, y + barH), 1, hex(kHyoBlue));
+                    y += barH + rowGap;
+                }
+            };
+
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoBold, g->memoBoldActive);
+              text(L"가", r, g->fmtSmallBold, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoUnderline, g->memoUnderlineActive);
+              text(L"가", r, g->fmtSmall, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+              float lineY = r.bottom - 8;
+              g->renderTarget->DrawLine(D2D1::Point2F(r.left + 8, lineY), D2D1::Point2F(r.right - 8, lineY), brush(hex(kHyoBlue)), 1.5f); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoAlignLeft, g->memoAlign == PFA_LEFT); drawAlignBars(r, PFA_LEFT); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoAlignCenter, g->memoAlign == PFA_CENTER); drawAlignBars(r, PFA_CENTER); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoAlignRight, g->memoAlign == PFA_RIGHT); drawAlignBars(r, PFA_RIGHT); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoSizeDown, false);
+              text(L"A-", r, g->fmtSmall, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoSizeUp, false);
+              text(L"A+", r, g->fmtSmall, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoFontColor, false);
+              text(L"가", r, g->fmtSmall, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+              roundedRect(D2D1::RectF(r.left + 6, r.bottom - 7, r.right - 6, r.bottom - 4), 1, hex(0xE03A3A)); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoBgColor, false);
+              text(L"가", r, g->fmtSmall, pal.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+              roundedRect(D2D1::RectF(r.left + 6, r.bottom - 7, r.right - 6, r.bottom - 4), 1, hex(0xFFD54A)); }
+            { D2D1_RECT_F r = memoBtnBox(g->rectMemoEmoji, false);
+              text(L"🙂", r, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER); }
         } else {
             g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoAlignLeft = g->rectMemoAlignCenter = g->rectMemoAlignRight = D2D1::RectF(0, 0, 0, 0);
@@ -1067,9 +1189,17 @@ void drawFrame(HWND hwnd) {
         }
         g->rectMemoEdit = D2D1::RectF(mx, memoCard.top + toolbarH + (g->fullscreen ? cardPad * 0.4f : 4.0f),
             memoCard.right - cardPad * 0.6f, memoCard.bottom - cardPad * 0.6f);
+    } else {
+        g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
+        g->rectMemoAlignLeft = g->rectMemoAlignCenter = g->rectMemoAlignRight = D2D1::RectF(0, 0, 0, 0);
+        g->rectMemoSizeDown = g->rectMemoSizeUp = D2D1::RectF(0, 0, 0, 0);
+        g->rectMemoFontColor = g->rectMemoBgColor = D2D1::RectF(0, 0, 0, 0);
+        g->rectMemoEmoji = D2D1::RectF(0, 0, 0, 0);
+        g->rectMemoEdit = D2D1::RectF(0, 0, 0, 0); // shrinks the native RichEdit to nothing via syncNativeControls
     }
 
     // ---- Right: timetable ----
+    if (showSchedule) {
     roundedRect(rightCard, 16, pal.surface, &pal.cardBorder);
     float rx = rightCard.left + cardPad;
     float ry = rightCard.top + cardPad - 4.0f;
@@ -1224,6 +1354,11 @@ void drawFrame(HWND hwnd) {
     } else {
         text(L"시험 일정 없음", D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + fBody->GetFontSize() * 1.5f), fBody, pal.textTertiary);
     }
+    } else {
+        g->rectAddPeriod = D2D1::RectF(0, 0, 0, 0);
+        g->periodRowRects.clear();
+        g->periodDeleteRects.clear();
+    }
 
     // Footer / about (verbatim brand format) — windowed/admin view only; the
     // fullscreen student display stays clean with no small print. The site
@@ -1232,13 +1367,15 @@ void drawFrame(HWND hwnd) {
         float footerY = size.height - padV - 24;
         float footerBottom = size.height - padV;
 
-        g->rectSiteLink = D2D1::RectF(size.width - pad - 78, footerY, size.width - pad, footerBottom);
-        text(L"hyot.dev", D2D1::RectF(g->rectSiteLink.left, footerY, g->rectSiteLink.left + 58, footerBottom),
-            g->fmtVersion, g->hoveredSiteLink ? hex(kHyoBlue) : pal.textTertiary);
-        text(L"", D2D1::RectF(g->rectSiteLink.left + 58, footerY, g->rectSiteLink.right, footerBottom),
+        // House icon sits in front of the hyot.dev text; both share one
+        // clickable hit-rect.
+        g->rectSiteLink = D2D1::RectF(size.width - pad - 96, footerY, size.width - pad, footerBottom);
+        text(L"", D2D1::RectF(g->rectSiteLink.left, footerY, g->rectSiteLink.left + 20, footerBottom),
             g->fmtIcon, g->hoveredSiteLink ? hex(kHyoBlue) : pal.textTertiary);
+        text(L"hyot.dev", D2D1::RectF(g->rectSiteLink.left + 22, footerY, g->rectSiteLink.right, footerBottom),
+            g->fmtVersion, g->hoveredSiteLink ? hex(kHyoBlue) : pal.textTertiary);
 
-        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" | © 2026 HyoT. All rights reserved.  ·";
+        std::wstring footer = L"HyoExam v" + std::wstring(kAppVersion) + L" · © 2026 HyoT. All rights reserved.  ·";
         text(footer, D2D1::RectF(size.width - pad - 480, footerY, g->rectSiteLink.left - 4, footerBottom),
             g->fmtVersion, pal.textTertiary, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -1286,6 +1423,8 @@ void drawFrame(HWND hwnd) {
         }
     }
     if (g->timeSourceDropdownOpen) drawTimeSourceDropdown();
+    if (g->displaySettingsOpen) drawDisplaySettingsDropdown();
+    if (g->memoEmojiPickerOpen) drawMemoEmojiPicker();
 
     HRESULT hr = g->renderTarget->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) discardDeviceResources();
@@ -1311,6 +1450,8 @@ void toggleFullscreen(HWND hwnd) {
         // Fullscreen is the student-facing display — always land on a clean view.
         g->editingPeriodIndex = -1;
         g->timeSourceDropdownOpen = false;
+        g->displaySettingsOpen = false;
+        g->memoEmojiPickerOpen = false;
         g->savingProfile = false;
         g->loadingProfile = false;
         g->fullscreenIconLastMoveMs = 0; // return icon starts hidden until the mouse actually moves
@@ -1666,6 +1807,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g->timeSourceDropdownOpen = false;
         } else if (ptInRect(pt, g->rectTimeSourceButton)) {
             g->timeSourceDropdownOpen = true;
+        } else if (g->displaySettingsOpen) {
+            if (ptInRect(pt, g->rectDisplayScheduleRow)) {
+                g->settings.fullscreenShowSchedule = !g->settings.fullscreenShowSchedule;
+                g->settings.save();
+            } else if (ptInRect(pt, g->rectDisplayMemoRow)) {
+                g->settings.fullscreenShowMemo = !g->settings.fullscreenShowMemo;
+                g->settings.save();
+            }
+            g->displaySettingsOpen = false;
+        } else if (ptInRect(pt, g->rectDisplaySettingsButton)) {
+            g->displaySettingsOpen = true;
         } else if (!g->fullscreen && ptInRect(pt, g->rectSiteLink)) {
             ShellExecuteW(nullptr, L"open", L"https://hyot.dev", nullptr, nullptr, SW_SHOWNORMAL);
         } else if (ptInRect(pt, g->rectFullscreenBtn)) {
@@ -1694,8 +1846,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             pickMemoColor(false);
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoBgColor)) {
             pickMemoColor(true);
+        } else if (g->memoEmojiPickerOpen) {
+            for (int i = 0; i < kSchoolEmojiCount; i++) {
+                if (ptInRect(pt, g->memoEmojiRects[i])) { insertMemoEmoji(kSchoolEmojis[i]); break; }
+            }
+            g->memoEmojiPickerOpen = false;
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoEmoji)) {
-            openMemoEmojiPicker();
+            g->memoEmojiPickerOpen = true;
         } else if (!g->fullscreen) {
             bool handled = false;
             for (auto& [r, id] : g->scheduleButtons) {

@@ -49,6 +49,8 @@ bool Settings::load() {
     fontScale = (float)root["fontScale"].asNumber(1.0);
     timeSourceIndex = (int)root["timeSourceIndex"].asNumber(0);
     activeScheduleId = utf8ToWide(root["activeScheduleId"].asString());
+    fullscreenShowSchedule = root["fullscreenShowSchedule"].asBool(true);
+    fullscreenShowMemo = root["fullscreenShowMemo"].asBool(true);
     return true;
 }
 
@@ -59,6 +61,8 @@ bool Settings::save() const {
     root.set("fontScale", Value::makeNumber(fontScale));
     root.set("timeSourceIndex", Value::makeNumber(timeSourceIndex));
     root.set("activeScheduleId", Value::makeString(wideToUtf8(activeScheduleId)));
+    root.set("fullscreenShowSchedule", Value::makeBool(fullscreenShowSchedule));
+    root.set("fullscreenShowMemo", Value::makeBool(fullscreenShowMemo));
 
     std::ofstream f(settingsPath(), std::ios::binary | std::ios::trunc);
     if (!f) return false;
