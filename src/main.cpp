@@ -163,6 +163,10 @@ struct AppState {
     // Hit-test rects for the admin toolbar, recomputed each frame it's drawn.
     D2D1_RECT_F rectFullscreenBtn{};
     D2D1_RECT_F rectThemeToggle{};
+    // Fullscreen-only: the return-to-window icon stays hidden until the mouse
+    // moves, then fades back out after 5s idle. 0 = hidden (not moved yet since
+    // entering fullscreen).
+    ULONGLONG fullscreenIconLastMoveMs = 0;
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
 
     // Footer site link.
@@ -219,7 +223,8 @@ struct AppState {
     D2D1_RECT_F rectMemoEdit{};
     D2D1_RECT_F rectMemoEditApplied{ -1, -1, -1, -1 }; // last rect actually SetWindowPos'd, so idle frames skip it
     int memoReadOnlyApplied = -1; // -1 = never set; avoids re-sending EM_SETREADONLY every idle frame
-    D2D1_RECT_F rectMemoBold{}, rectMemoUnderline{}, rectMemoSizeDown{}, rectMemoSizeUp{}, rectMemoFontColor{}, rectMemoBgColor{};
+    int memoBorderApplied = -1;   // -1 = never set; the sunken WS_EX_CLIENTEDGE border is windowed-only (looks out of place on the clean fullscreen display)
+    D2D1_RECT_F rectMemoBold{}, rectMemoUnderline{}, rectMemoSizeDown{}, rectMemoSizeUp{}, rectMemoFontColor{}, rectMemoBgColor{}, rectMemoEmoji{};
     bool memoBoldActive = false, memoUnderlineActive = false;
     COLORREF memoCustomColors[16]{}; // persists the ChooseColor "custom colors" row across both pickers
 
@@ -337,10 +342,11 @@ void buildFullscreenFonts(float height) {
 void buildPeriodRowFonts(float rowH) {
     if (g->fmtPeriodTitleFS) g->fmtPeriodTitleFS->Release();
     if (g->fmtPeriodTimeFS) g->fmtPeriodTimeFS->Release();
-    float titleSize = std::clamp(rowH * 0.26f, 22.0f, 120.0f);
-    float timeSize = std::clamp(rowH * 0.18f, 16.0f, 80.0f);
-    g->fmtPeriodTitleFS = makeFormat(kUiFontFamily, titleSize, DWRITE_FONT_WEIGHT_MEDIUM);
-    g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_NORMAL);
+    float titleSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f);
+    float timeSize = std::clamp(rowH * 0.21f, 18.0f, 84.0f);
+    // Bold title reads better at a glance from across a classroom.
+    g->fmtPeriodTitleFS = makeFormat(kUiFontFamily, titleSize, DWRITE_FONT_WEIGHT_BOLD);
+    g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fsPeriodBuiltForRowH = rowH;
 }
 
@@ -637,6 +643,17 @@ void syncNativeControls() {
             SendMessageW(g->hRichMemo, EM_SETREADONLY, wantReadOnly, 0);
             g->memoReadOnlyApplied = wantReadOnly;
         }
+        // Sunken 3D edge reads as "windowed app chrome" -- drop it in fullscreen
+        // so the memo box blends into the clean signage display.
+        int wantBorder = g->fullscreen ? 0 : 1;
+        if (wantBorder != g->memoBorderApplied) {
+            LONG_PTR ex = GetWindowLongPtrW(g->hRichMemo, GWL_EXSTYLE);
+            ex = wantBorder ? (ex | WS_EX_CLIENTEDGE) : (ex & ~WS_EX_CLIENTEDGE);
+            SetWindowLongPtrW(g->hRichMemo, GWL_EXSTYLE, ex);
+            SetWindowPos(g->hRichMemo, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            g->memoBorderApplied = wantBorder;
+        }
     }
 }
 
@@ -774,6 +791,20 @@ void pickMemoColor(bool background) {
     SetFocus(g->hRichMemo);
 }
 
+// Opens the built-in Windows 10/11 emoji panel (the same one Win+. opens
+// anywhere) with the memo focused, so picking an emoji inserts it at the
+// caret. There's no public API to open it directly; simulating the shortcut
+// on a focused text field is the standard/only way to trigger it.
+void openMemoEmojiPicker() {
+    SetFocus(g->hRichMemo);
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_LWIN;
+    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_OEM_PERIOD;
+    in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = VK_OEM_PERIOD; in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_LWIN; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
 // Only the canvas background follows the theme -- per-run text/highlight colors
 // the user picked are left alone (SCF_DEFAULT would stomp on them).
 void applyMemoTheme() {
@@ -881,12 +912,15 @@ void drawFrame(HWND hwnd) {
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         // Fullscreen still exposes one unobtrusive "return to window" icon,
-        // top-left corner, for mouse-only setups (no keyboard for Esc/F11).
+        // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
+        // Hidden until the mouse moves, then fades back out after 5s idle (see
+        // the fade-out block near the end of drawFrame) so it doesn't clutter
+        // the clean signage display.
         // Only the hit-rect is computed here -- the actual drawing happens near
         // the end of drawFrame, after the clock card's rounded-corner fill
         // would otherwise paint right over this same corner and hide it.
         float iconSize = 54;
-        g->rectFullscreenBtn = D2D1::RectF(pad, padV, pad + iconSize, padV + iconSize);
+        g->rectFullscreenBtn = D2D1::RectF(size.width - pad - iconSize, padV, size.width - pad, padV + iconSize);
         g->rectThemeToggle = D2D1::RectF(0, 0, 0, 0);
         g->rectSaveIcon = D2D1::RectF(0, 0, 0, 0);
         g->rectLoadIcon = D2D1::RectF(0, 0, 0, 0);
@@ -987,10 +1021,12 @@ void drawFrame(HWND hwnd) {
             memoBtn(g->rectMemoSizeUp, L"A+", false, hex(kHyoBlue));
             memoBtn(g->rectMemoFontColor, L"가", false, hex(kHyoBlue));
             memoBtn(g->rectMemoBgColor, L"■", false, hex(kOrange));
+            memoBtn(g->rectMemoEmoji, L"🙂", false, hex(kHyoBlue));
         } else {
             g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoSizeDown = g->rectMemoSizeUp = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoFontColor = g->rectMemoBgColor = D2D1::RectF(0, 0, 0, 0);
+            g->rectMemoEmoji = D2D1::RectF(0, 0, 0, 0);
         }
         g->rectMemoEdit = D2D1::RectF(mx, memoCard.top + toolbarH + (g->fullscreen ? cardPad * 0.4f : 4.0f),
             memoCard.right - cardPad * 0.6f, memoCard.bottom - cardPad * 0.6f);
@@ -1077,7 +1113,11 @@ void drawFrame(HWND hwnd) {
                 roundedRect(row, 10, hex(kHyoBlue, 0.05f), &pal.cardBorder);
             }
 
-            float textRight = !g->fullscreen ? row.right - 46 : row.right - 14;
+            // Fullscreen rows are much wider/taller than windowed ones, so a flat
+            // 14px left inset (tuned for the compact windowed list) reads as
+            // cramped against the card edge -- scale it up for fullscreen.
+            float textLeft = row.left + (g->fullscreen ? 40.0f : 14.0f);
+            float textRight = !g->fullscreen ? row.right - 46 : row.right - 32;
             // Title/time line positions scale off the actual chosen font sizes
             // (rather than fixed 6/34/36/14px offsets) so fullscreen's larger
             // rowTitleFmt/rowTimeFmt don't clip or crowd inside the also-larger rowH.
@@ -1086,15 +1126,15 @@ void drawFrame(HWND hwnd) {
             // the period's whole visual block now.
             float titleH = rowTitleFmt->GetFontSize() * 1.3f;
             float timeH = rowTimeFmt->GetFontSize() * 1.3f;
-            float lineGap = rowTitleFmt->GetFontSize() * 0.15f;
+            float lineGap = rowTitleFmt->GetFontSize() * 0.22f;
             float titleTop = g->fullscreen
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
             float timeTop = titleTop + titleH + lineGap;
-            text(p.label + L" " + p.subject, D2D1::RectF(row.left + 14, titleTop, textRight, titleTop + titleH),
+            text(p.label + L" " + p.subject, D2D1::RectF(textLeft, titleTop, textRight, titleTop + titleH),
                 rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
             text(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                D2D1::RectF(row.left + 14, timeTop, textRight, timeTop + timeH),
+                D2D1::RectF(textLeft, timeTop, textRight, timeTop + timeH),
                 rowTimeFmt, pal.textSecondary);
 
             if (!g->fullscreen) {
@@ -1141,10 +1181,18 @@ void drawFrame(HWND hwnd) {
 
     // Drawn last so the fullscreen return-to-window icon (rect computed earlier,
     // in the toolbar block) actually sits on top of the schedule card's fill
-    // instead of being painted over by it.
-    if (g->fullscreen) {
-        roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.16f));
-        text(L"", g->rectFullscreenBtn, g->fmtIconBox, hex(kHyoBlue, 0.9f), DWRITE_TEXT_ALIGNMENT_CENTER);
+    // instead of being painted over by it. Hidden until the mouse moves, then
+    // fades out after 5s of no further movement.
+    if (g->fullscreen && g->fullscreenIconLastMoveMs != 0) {
+        ULONGLONG elapsed = GetTickCount64() - g->fullscreenIconLastMoveMs;
+        const ULONGLONG visibleMs = 5000, fadeMs = 800;
+        float alpha = elapsed < visibleMs ? 1.0f
+            : elapsed < visibleMs + fadeMs ? 1.0f - (float)(elapsed - visibleMs) / (float)fadeMs
+            : 0.0f;
+        if (alpha > 0.001f) {
+            roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.16f * alpha));
+            text(L"", g->rectFullscreenBtn, g->fmtIconBox, hex(kHyoBlue, 0.9f * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
     }
 
     if (g->editingPeriodIndex != -1) drawPeriodEditor(size);
@@ -1197,6 +1245,7 @@ void toggleFullscreen(HWND hwnd) {
         g->timeSourceDropdownOpen = false;
         g->savingProfile = false;
         g->loadingProfile = false;
+        g->fullscreenIconLastMoveMs = 0; // return icon starts hidden until the mouse actually moves
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g->prevPlacement);
@@ -1566,6 +1615,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             pickMemoColor(false);
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoBgColor)) {
             pickMemoColor(true);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoEmoji)) {
+            openMemoEmojiPicker();
         } else if (!g->fullscreen) {
             bool handled = false;
             for (auto& [r, id] : g->scheduleButtons) {
@@ -1593,6 +1644,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         POINT pt{ LOWORD(lParam), HIWORD(lParam) };
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
+        if (g->fullscreen) {
+            g->fullscreenIconLastMoveMs = GetTickCount64();
+        }
         if (g->pendingIsPeriodClick) {
             int dx = pt.x - g->mouseDownPt.x, dy = pt.y - g->mouseDownPt.y;
             if (!g->isDraggingPeriod && (std::abs(dx) > 6 || std::abs(dy) > 6)) {
