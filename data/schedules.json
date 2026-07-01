@@ -1,0 +1,44 @@
+{
+  "activeId": "mock_exam",
+  "schedules": [
+    {
+      "id": "mock_exam",
+      "name": "모의고사",
+      "grade": "3학년",
+      "periods": [
+        { "label": "1교시", "subject": "국어", "durationMinutes": 80, "start": "08:40", "end": "10:00" },
+        { "label": "2교시", "subject": "수학", "durationMinutes": 100, "start": "10:30", "end": "12:10" },
+        { "label": "3교시", "subject": "영어", "durationMinutes": 70, "start": "13:10", "end": "14:20" },
+        { "label": "4교시", "subject": "한국사", "durationMinutes": 30, "start": "14:50", "end": "15:20" },
+        { "label": "4교시", "subject": "사회탐구", "durationMinutes": 30, "start": "15:35", "end": "16:05" },
+        { "label": "4교시", "subject": "과학탐구", "durationMinutes": 30, "start": "16:07", "end": "16:37" }
+      ],
+      "breaks": [
+        { "start": "15:20", "end": "15:35", "note": "한국사 답지 회수, 탐구 시험지·답지 배부" }
+      ],
+      "notices": [
+        "시험 시작 시간 10분 전에 착석 후 대기할 것!",
+        "답안지 작성 유의사항: 컴퓨터용 사인펜만 사용할 것 (예비마킹 금지!)",
+        "필적확인란에 컴퓨터용 사인펜으로 자필 기재할 것"
+      ]
+    },
+    {
+      "id": "midterm",
+      "name": "내신 (중간·기말고사)",
+      "grade": "",
+      "periods": [
+        { "label": "1교시", "subject": "국어", "durationMinutes": 50, "start": "09:00", "end": "09:50" },
+        { "label": "2교시", "subject": "수학", "durationMinutes": 50, "start": "10:10", "end": "11:00" },
+        { "label": "3교시", "subject": "영어", "durationMinutes": 50, "start": "11:20", "end": "12:10" }
+      ],
+      "breaks": [
+        { "start": "09:50", "end": "10:10", "note": "답안지 회수 및 배부" },
+        { "start": "11:00", "end": "11:20", "note": "답안지 회수 및 배부" }
+      ],
+      "notices": [
+        "시험 시작 시간 10분 전에 착석 후 대기할 것!",
+        "답안지 작성 유의사항: 컴퓨터용 사인펜만 사용할 것 (예비마킹 금지!)"
+      ]
+    }
+  ]
+}
