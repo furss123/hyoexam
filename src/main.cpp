@@ -151,6 +151,7 @@ struct AppState {
     IDWriteTextFormat* fmtPeriodTitleFS = nullptr;
     IDWriteTextFormat* fmtPeriodTimeFS = nullptr;
     float fsPeriodBuiltForRowH = -1.0f;
+    float fsPeriodTimeCorrectedForWidth = -1.0f; // re-check against the actual row width, like fsClockCorrectedForWidth
 
     Settings settings;
     ScheduleStore scheduleStore;
@@ -167,6 +168,7 @@ struct AppState {
     // moves, then fades back out after 5s idle. 0 = hidden (not moved yet since
     // entering fullscreen).
     ULONGLONG fullscreenIconLastMoveMs = 0;
+    bool cursorHiddenInFullscreen = false; // mirrors the icon's visible/hidden state so the two disappear/reappear together
     std::vector<std::pair<D2D1_RECT_F, std::wstring>> scheduleButtons;
 
     // Footer site link.
@@ -225,7 +227,9 @@ struct AppState {
     int memoReadOnlyApplied = -1; // -1 = never set; avoids re-sending EM_SETREADONLY every idle frame
     int memoBorderApplied = -1;   // -1 = never set; the sunken WS_EX_CLIENTEDGE border is windowed-only (looks out of place on the clean fullscreen display)
     D2D1_RECT_F rectMemoBold{}, rectMemoUnderline{}, rectMemoSizeDown{}, rectMemoSizeUp{}, rectMemoFontColor{}, rectMemoBgColor{}, rectMemoEmoji{};
+    D2D1_RECT_F rectMemoAlignLeft{}, rectMemoAlignCenter{}, rectMemoAlignRight{};
     bool memoBoldActive = false, memoUnderlineActive = false;
+    WORD memoAlign = PFA_LEFT;
     COLORREF memoCustomColors[16]{}; // persists the ChooseColor "custom colors" row across both pickers
 
     HWND hEditLabel = nullptr, hEditSubject = nullptr;
@@ -343,11 +347,16 @@ void buildPeriodRowFonts(float rowH) {
     if (g->fmtPeriodTitleFS) g->fmtPeriodTitleFS->Release();
     if (g->fmtPeriodTimeFS) g->fmtPeriodTimeFS->Release();
     float titleSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f);
-    float timeSize = std::clamp(rowH * 0.21f, 18.0f, 84.0f);
+    // Height-only guess, tuned bigger than before -- the actual applied size is
+    // re-checked against the real row width in drawFrame (fsPeriodTimeCorrectedForWidth)
+    // and shrunk if it would wrap the "HH:MM ~ HH:MM(NN분)" line to two lines.
+    float timeSize = std::clamp(rowH * 0.30f, 18.0f, 110.0f);
     // Bold title reads better at a glance from across a classroom.
     g->fmtPeriodTitleFS = makeFormat(kUiFontFamily, titleSize, DWRITE_FONT_WEIGHT_BOLD);
     g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_MEDIUM);
+    g->fmtPeriodTimeFS->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     g->fsPeriodBuiltForRowH = rowH;
+    g->fsPeriodTimeCorrectedForWidth = -1.0f; // force the width-fit re-check against the fresh format
 }
 
 void createDeviceIndependentResources() {
@@ -724,12 +733,26 @@ CHARFORMAT2W getMemoSelectionFormat() {
     return cf;
 }
 
-// Called each frame (windowed only) so the B/U buttons reflect the format at the
-// current selection/caret instead of a stale toggle guess.
+// Called each frame (windowed only) so the B/U/alignment buttons reflect the
+// format at the current selection/caret instead of a stale toggle guess.
 void refreshMemoToolbarState() {
     CHARFORMAT2W cf = getMemoSelectionFormat();
     g->memoBoldActive = (cf.dwMask & CFM_BOLD) && (cf.dwEffects & CFE_BOLD);
     g->memoUnderlineActive = (cf.dwMask & CFM_UNDERLINE) && (cf.dwEffects & CFE_UNDERLINE);
+
+    PARAFORMAT2 pf{};
+    pf.cbSize = sizeof(pf);
+    SendMessageW(g->hRichMemo, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    g->memoAlign = (pf.dwMask & PFM_ALIGNMENT) ? pf.wAlignment : PFA_LEFT;
+}
+
+void setMemoAlign(WORD align) {
+    PARAFORMAT2 pf{};
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_ALIGNMENT;
+    pf.wAlignment = align;
+    SendMessageW(g->hRichMemo, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    SetFocus(g->hRichMemo);
 }
 
 void toggleMemoBold() {
@@ -805,13 +828,23 @@ void openMemoEmojiPicker() {
     SendInput(4, in, sizeof(INPUT));
 }
 
-// Only the canvas background follows the theme -- per-run text/highlight colors
-// the user picked are left alone (SCF_DEFAULT would stomp on them).
+// Canvas background follows the theme, and so does the *default* text color
+// (SCF_DEFAULT only affects new/unformatted typing, never touching whatever
+// explicit colors the user already picked via pickMemoColor) -- otherwise
+// freshly typed text stays RichEdit's built-in black default, which is
+// unreadable against the dark-mode background.
 void applyMemoTheme() {
     if (!g->hRichMemo) return;
     Palette pal = currentPalette();
     COLORREF bg = RGB((BYTE)(pal.surface.r * 255), (BYTE)(pal.surface.g * 255), (BYTE)(pal.surface.b * 255));
     SendMessageW(g->hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)bg);
+
+    COLORREF fg = RGB((BYTE)(pal.textPrimary.r * 255), (BYTE)(pal.textPrimary.g * 255), (BYTE)(pal.textPrimary.b * 255));
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR;
+    cf.crTextColor = fg;
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
 }
 
 // ---- Main frame ----
@@ -1017,6 +1050,9 @@ void drawFrame(HWND hwnd) {
             };
             memoBtn(g->rectMemoBold, L"B", g->memoBoldActive, hex(kHyoBlue));
             memoBtn(g->rectMemoUnderline, L"U", g->memoUnderlineActive, hex(kHyoBlue));
+            memoBtn(g->rectMemoAlignLeft, L"L", g->memoAlign == PFA_LEFT, hex(kHyoBlue));
+            memoBtn(g->rectMemoAlignCenter, L"C", g->memoAlign == PFA_CENTER, hex(kHyoBlue));
+            memoBtn(g->rectMemoAlignRight, L"R", g->memoAlign == PFA_RIGHT, hex(kHyoBlue));
             memoBtn(g->rectMemoSizeDown, L"A-", false, hex(kHyoBlue));
             memoBtn(g->rectMemoSizeUp, L"A+", false, hex(kHyoBlue));
             memoBtn(g->rectMemoFontColor, L"가", false, hex(kHyoBlue));
@@ -1024,6 +1060,7 @@ void drawFrame(HWND hwnd) {
             memoBtn(g->rectMemoEmoji, L"🙂", false, hex(kHyoBlue));
         } else {
             g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
+            g->rectMemoAlignLeft = g->rectMemoAlignCenter = g->rectMemoAlignRight = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoSizeDown = g->rectMemoSizeUp = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoFontColor = g->rectMemoBgColor = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoEmoji = D2D1::RectF(0, 0, 0, 0);
@@ -1118,6 +1155,29 @@ void drawFrame(HWND hwnd) {
             // cramped against the card edge -- scale it up for fullscreen.
             float textLeft = row.left + (g->fullscreen ? 40.0f : 14.0f);
             float textRight = !g->fullscreen ? row.right - 46 : row.right - 32;
+
+            // The height-only guess in buildPeriodRowFonts() can size the time
+            // line too wide for narrower cards (it doesn't know the row width
+            // yet); re-check against the real available width here and shrink
+            // if needed so "HH:MM ~ HH:MM(NN분)" never wraps to a second line,
+            // while leaving the little right margin textRight already reserves.
+            if (g->fullscreen) {
+                float availWidth = textRight - textLeft;
+                if (g->fsPeriodTimeCorrectedForWidth != availWidth) {
+                    const float kTimeCharCount = 19.0f;  // "00:00 ~ 00:00(999분)" worst case
+                    const float kTimeAdvanceEm = 0.56f;  // approx. advance width as a fraction of em
+                    float widthFitSize = availWidth / (kTimeCharCount * kTimeAdvanceEm);
+                    float appliedSize = std::min(rowTimeFmt->GetFontSize(), std::clamp(widthFitSize, 16.0f, 110.0f));
+                    if (appliedSize != rowTimeFmt->GetFontSize()) {
+                        rowTimeFmt->Release();
+                        rowTimeFmt = makeFormat(kUiFontFamily, appliedSize, DWRITE_FONT_WEIGHT_MEDIUM);
+                        rowTimeFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                        g->fmtPeriodTimeFS = rowTimeFmt;
+                    }
+                    g->fsPeriodTimeCorrectedForWidth = availWidth;
+                }
+            }
+
             // Title/time line positions scale off the actual chosen font sizes
             // (rather than fixed 6/34/36/14px offsets) so fullscreen's larger
             // rowTitleFmt/rowTimeFmt don't clip or crowd inside the also-larger rowH.
@@ -1131,11 +1191,15 @@ void drawFrame(HWND hwnd) {
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
             float timeTop = titleTop + titleH + lineGap;
+            // Time/subject colors swapped from the original design: the period
+            // time now carries the stronger (primary) color and the label/subject
+            // the softer (secondary) one -- matches how this schedule is actually
+            // scanned (time first).
             text(p.label + L" " + p.subject, D2D1::RectF(textLeft, titleTop, textRight, titleTop + titleH),
-                rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
+                rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
             text(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
                 D2D1::RectF(textLeft, timeTop, textRight, timeTop + timeH),
-                rowTimeFmt, pal.textSecondary);
+                rowTimeFmt, pal.textPrimary);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
@@ -1182,9 +1246,10 @@ void drawFrame(HWND hwnd) {
     // Drawn last so the fullscreen return-to-window icon (rect computed earlier,
     // in the toolbar block) actually sits on top of the schedule card's fill
     // instead of being painted over by it. Hidden until the mouse moves, then
-    // fades out after 5s of no further movement.
-    if (g->fullscreen && g->fullscreenIconLastMoveMs != 0) {
-        ULONGLONG elapsed = GetTickCount64() - g->fullscreenIconLastMoveMs;
+    // fades out after 5s of no further movement -- the mouse pointer itself
+    // hides/shows in lockstep (see cursorHiddenInFullscreen).
+    if (g->fullscreen) {
+        ULONGLONG elapsed = g->fullscreenIconLastMoveMs == 0 ? MAXULONGLONG : GetTickCount64() - g->fullscreenIconLastMoveMs;
         const ULONGLONG visibleMs = 5000, fadeMs = 800;
         float alpha = elapsed < visibleMs ? 1.0f
             : elapsed < visibleMs + fadeMs ? 1.0f - (float)(elapsed - visibleMs) / (float)fadeMs
@@ -1192,6 +1257,9 @@ void drawFrame(HWND hwnd) {
         if (alpha > 0.001f) {
             roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.16f * alpha));
             text(L"", g->rectFullscreenBtn, g->fmtIconBox, hex(kHyoBlue, 0.9f * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else if (!g->cursorHiddenInFullscreen) {
+            ShowCursor(FALSE);
+            g->cursorHiddenInFullscreen = true;
         }
     }
 
@@ -1252,6 +1320,11 @@ void toggleFullscreen(HWND hwnd) {
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         g->fullscreen = false;
+        // The cursor-hide is fullscreen-only chrome; always restore it on the way out.
+        if (g->cursorHiddenInFullscreen) {
+            ShowCursor(TRUE);
+            g->cursorHiddenInFullscreen = false;
+        }
     }
 }
 
@@ -1607,6 +1680,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             toggleMemoBold();
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoUnderline)) {
             toggleMemoUnderline();
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoAlignLeft)) {
+            setMemoAlign(PFA_LEFT);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoAlignCenter)) {
+            setMemoAlign(PFA_CENTER);
+        } else if (!g->fullscreen && ptInRect(pt, g->rectMemoAlignRight)) {
+            setMemoAlign(PFA_RIGHT);
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoSizeDown)) {
             adjustMemoFontSize(-2);
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoSizeUp)) {
@@ -1646,6 +1725,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         TrackMouseEvent(&tme);
         if (g->fullscreen) {
             g->fullscreenIconLastMoveMs = GetTickCount64();
+            if (g->cursorHiddenInFullscreen) {
+                ShowCursor(TRUE);
+                g->cursorHiddenInFullscreen = false;
+            }
         }
         if (g->pendingIsPeriodClick) {
             int dx = pt.x - g->mouseDownPt.x, dy = pt.y - g->mouseDownPt.y;
@@ -1719,6 +1802,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         KillTimer(hwnd, kTickTimerId);
         if (g->hRichMemo && SendMessageW(g->hRichMemo, EM_GETMODIFY, 0, 0)) saveMemoRtf();
+        if (g->cursorHiddenInFullscreen) ShowCursor(TRUE); // never leave the system cursor hidden on exit
         PostQuitMessage(0);
         return 0;
     }
