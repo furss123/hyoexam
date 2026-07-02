@@ -11,7 +11,7 @@
 namespace hyo {
 
 namespace {
-    constexpr auto kSyncInterval = std::chrono::seconds(1);
+    constexpr auto kSyncInterval = std::chrono::seconds(3);
     constexpr DWORD kRequestTimeoutMs = 3000;
     constexpr double kNtpToUnixEpochSeconds = 2208988800.0;   // 1900 -> 1970
     constexpr double kUnixToFileTimeEpochSeconds = 11644473600.0; // 1970 -> 1601

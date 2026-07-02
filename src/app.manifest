@@ -16,4 +16,13 @@
       <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
     </application>
   </compatibility>
+  <!-- Visual-styles-enabled comctl32, required for SetWindowTheme's
+       "DarkMode_CFD" trick to actually re-skin the native Edit/ComboBox
+       controls (period editor fields, profile-name field) in dark mode. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
 </assembly>

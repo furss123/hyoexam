@@ -160,7 +160,14 @@ private:
     }
 };
 
-inline Value parse(const std::string& text) { return Parser(text).parse(); }
+// Never throws: a truncated/corrupt file (e.g. the process was killed mid-write,
+// which leaves an std::ios::trunc'd file half-written) would otherwise surface as
+// std::stod/std::stoi/substr exceptions and crash the app on launch. Callers all
+// treat a Null result as "no data" and fall back to defaults, so swallow here.
+inline Value parse(const std::string& text) {
+    try { return Parser(text).parse(); }
+    catch (...) { return Value(); }
+}
 
 inline void escapeInto(std::ostringstream& os, const std::string& s) {
     for (char c : s) {

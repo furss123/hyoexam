@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <uxtheme.h> // SetWindowTheme — dark-mode re-skin for native Edit/ComboBox controls
 #define _RICHEDIT_VER 0x0500 // CHARFORMAT2W / RICHEDIT50W (Msftedit.dll)
 #include <richedit.h>
 #include <string>
@@ -26,6 +27,7 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 using namespace hyo;
 
@@ -135,6 +137,7 @@ struct AppState {
     ID2D1Factory* d2dFactory = nullptr;
     IDWriteFactory* dwriteFactory = nullptr;
     ID2D1HwndRenderTarget* renderTarget = nullptr;
+    ID2D1SolidColorBrush* scratchBrush = nullptr; // one reusable fill/stroke brush, recolored per draw call
 
     IDWriteTextFormat* fmtClock = nullptr;
     IDWriteTextFormat* fmtDate = nullptr;
@@ -145,6 +148,7 @@ struct AppState {
     IDWriteTextFormat* fmtVersion = nullptr;
     IDWriteTextFormat* fmtIcon = nullptr;      // inline glyphs (footer link arrow, dropdown chevron)
     IDWriteTextFormat* fmtIconBox = nullptr;   // larger glyphs inside boxed icon buttons (save/load/theme/fullscreen/delete)
+    IDWriteTextFormat* fmtPeriodTimeWin = nullptr; // windowed period-row time text — fmtSmall + 10pt, kept separate so it doesn't resize fmtSmall everywhere else
 
     // Fullscreen (TV/projector) variants of clock/date/body/small — sized off the
     // actual monitor resolution so the student-facing display fills the frame
@@ -155,6 +159,12 @@ struct AppState {
     IDWriteTextFormat* fmtSmallFS = nullptr;
     float fsFontsBuiltForHeight = -1.0f;
     float fsClockCorrectedForWidth = -1.0f;
+    // The height-only size computed in buildFullscreenFonts(), before any
+    // width-fit shrink is applied — the width-fit correction re-derives from
+    // this fixed baseline (not from the format's current, possibly already
+    // shrunk, size) so the clock grows back when the 표시 panel toggles free
+    // up width, instead of only ever being able to shrink further.
+    float fsClockBaseSize = -1.0f;
 
     // Fullscreen period-row title/time text is sized off the actual row height
     // (not a fixed windowed size), so a handful of periods fill their large
@@ -163,6 +173,7 @@ struct AppState {
     IDWriteTextFormat* fmtPeriodTimeFS = nullptr;
     float fsPeriodBuiltForRowH = -1.0f;
     float fsPeriodTimeCorrectedForWidth = -1.0f; // re-check against the actual row width, like fsClockCorrectedForWidth
+    float fsPeriodTimeBaseSize = -1.0f; // height-only baseline, same grow-back purpose as fsClockBaseSize
 
     Settings settings;
     ScheduleStore scheduleStore;
@@ -208,6 +219,15 @@ struct AppState {
     D2D1_RECT_F rectPeriodSave{}, rectPeriodCancel{}, rectPeriodDelete{};
     D2D1_RECT_F rectFieldLabel{}, rectFieldSubject{};
     D2D1_RECT_F rectFieldStartHour{}, rectFieldStartMinute{}, rectFieldEndHour{}, rectFieldEndMinute{};
+    // Last rect/visibility actually applied to each period-field control, so a
+    // redraw that doesn't actually move anything (e.g. mouse hover elsewhere
+    // while the popup is up) skips the SetWindowPos call -- reapplying it on a
+    // combo box that's currently dropped down closes the drop-down list out
+    // from under the user before they can pick a value.
+    D2D1_RECT_F rectFieldLabelApplied{ -1, -1, -1, -1 }, rectFieldSubjectApplied{ -1, -1, -1, -1 };
+    D2D1_RECT_F rectFieldStartHourApplied{ -1, -1, -1, -1 }, rectFieldStartMinuteApplied{ -1, -1, -1, -1 };
+    D2D1_RECT_F rectFieldEndHourApplied{ -1, -1, -1, -1 }, rectFieldEndMinuteApplied{ -1, -1, -1, -1 };
+    int periodFieldsShownApplied = -1; // -1 = never set
 
     // Period row hover (click affordance) and drag-to-reorder.
     int hoveredPeriodRow = -1;
@@ -240,10 +260,12 @@ struct AppState {
     // Always visible in both windowed and fullscreen; only editable/toolbar-
     // enabled in windowed mode.
     HWND hRichMemo = nullptr;
+    WNDPROC richMemoDefaultProc = nullptr; // original RichEdit WndProc, saved by the fullscreen-caret subclass below
     D2D1_RECT_F rectMemoEdit{};
     D2D1_RECT_F rectMemoEditApplied{ -1, -1, -1, -1 }; // last rect actually SetWindowPos'd, so idle frames skip it
     int memoReadOnlyApplied = -1; // -1 = never set; avoids re-sending EM_SETREADONLY every idle frame
     int memoBorderApplied = -1;   // -1 = never set; the sunken WS_EX_CLIENTEDGE border is windowed-only (looks out of place on the clean fullscreen display)
+    int memoHiddenApplied = -1;   // -1 = never set; avoids re-sending ShowWindow every idle frame (250ms timer + every mouse-move repaint add up fast)
     D2D1_RECT_F rectMemoBold{}, rectMemoUnderline{}, rectMemoSizeDown{}, rectMemoSizeUp{}, rectMemoFontColor{}, rectMemoBgColor{}, rectMemoEmoji{};
     D2D1_RECT_F rectMemoAlignLeft{}, rectMemoAlignCenter{}, rectMemoAlignRight{};
     bool memoBoldActive = false, memoUnderlineActive = false;
@@ -256,6 +278,7 @@ struct AppState {
     HWND hComboStartHour = nullptr, hComboStartMinute = nullptr, hComboEndHour = nullptr, hComboEndMinute = nullptr;
     HWND hEditProfileName = nullptr;
     HFONT hUiFont = nullptr;
+    HBRUSH hNativeCtlBgBrush = nullptr; // theme-matched background for WM_CTLCOLOREDIT/WM_CTLCOLORLISTBOX
 };
 
 AppState* g = nullptr;
@@ -315,6 +338,7 @@ void buildFonts() {
     if (g->fmtBody) g->fmtBody->Release();
     if (g->fmtSmall) g->fmtSmall->Release();
     if (g->fmtSmallBold) g->fmtSmallBold->Release();
+    if (g->fmtPeriodTimeWin) g->fmtPeriodTimeWin->Release();
 
     const wchar_t* family = kUiFontFamily;
     g->fmtClock = makeFormat(family, 150.0f, DWRITE_FONT_WEIGHT_BOLD);
@@ -323,6 +347,8 @@ void buildFonts() {
     g->fmtBody = makeFormat(family, 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmall = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_NORMAL);
     g->fmtSmallBold = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_BOLD); // memo toolbar's "가" (Bold) icon
+    g->fmtPeriodTimeWin = makeFormat(family, 25.0f, DWRITE_FONT_WEIGHT_NORMAL); // windowed period-row time text: fmtSmall (15pt) + 10pt
+    g->fmtPeriodTimeWin->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     g->fmtClock->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     // Headings are single-line titles — clip rather than wrap-and-overlap the row below
     // when the window gets narrow (e.g. windowed edit mode at a small size).
@@ -358,6 +384,7 @@ void buildFullscreenFonts(float height) {
     g->fmtBodyFS = makeFormat(family, bodySize, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmallFS = makeFormat(family, smallSize, DWRITE_FONT_WEIGHT_NORMAL);
     g->fsFontsBuiltForHeight = height;
+    g->fsClockBaseSize = clockSize;
     g->fsClockCorrectedForWidth = -1.0f; // force the width-fit re-check in drawFrame against the fresh clock format
 }
 
@@ -378,6 +405,7 @@ void buildPeriodRowFonts(float rowH) {
     g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtPeriodTimeFS->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     g->fsPeriodBuiltForRowH = rowH;
+    g->fsPeriodTimeBaseSize = timeSize;
     g->fsPeriodTimeCorrectedForWidth = -1.0f; // force the width-fit re-check against the fresh format
 }
 
@@ -398,6 +426,10 @@ void createDeviceIndependentResources() {
 }
 
 void discardDeviceResources() {
+    // scratchBrush is created against renderTarget, so it must die with it --
+    // otherwise the next brush() call would hand back a brush bound to a
+    // released device (D2DERR_RECREATE_TARGET path).
+    if (g->scratchBrush) { g->scratchBrush->Release(); g->scratchBrush = nullptr; }
     if (g->renderTarget) { g->renderTarget->Release(); g->renderTarget = nullptr; }
 }
 
@@ -411,11 +443,14 @@ void createDeviceResources(HWND hwnd) {
         &g->renderTarget);
 }
 
+// Every text()/roundedRect() call needs a solid brush; rather than create and
+// release one per call (dozens per frame), keep a single brush alive for the
+// life of the render target and just recolor it. Freed in discardDeviceResources
+// so it never outlives the device it was created against.
 ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
-    static ID2D1SolidColorBrush* b = nullptr;
-    if (b) { b->Release(); b = nullptr; }
-    g->renderTarget->CreateSolidColorBrush(c, &b);
-    return b;
+    if (!g->scratchBrush) g->renderTarget->CreateSolidColorBrush(c, &g->scratchBrush);
+    else g->scratchBrush->SetColor(c);
+    return g->scratchBrush;
 }
 
 void roundedRect(D2D1_RECT_F r, float radius, D2D1_COLOR_F fill, D2D1_COLOR_F* border = nullptr) {
@@ -669,28 +704,40 @@ void drawLoadProfilePopup(D2D1_SIZE_F size) {
 void syncNativeControls() {
     bool showPeriodFields = g->editingPeriodIndex != -1;
     int periodShow = showPeriodFields ? SW_SHOWNA : SW_HIDE;
-    ShowWindow(g->hEditLabel, periodShow);
-    ShowWindow(g->hEditSubject, periodShow);
-    ShowWindow(g->hComboStartHour, periodShow);
-    ShowWindow(g->hComboStartMinute, periodShow);
-    ShowWindow(g->hComboEndHour, periodShow);
-    ShowWindow(g->hComboEndMinute, periodShow);
+    if (periodShow != g->periodFieldsShownApplied) {
+        ShowWindow(g->hEditLabel, periodShow);
+        ShowWindow(g->hEditSubject, periodShow);
+        ShowWindow(g->hComboStartHour, periodShow);
+        ShowWindow(g->hComboStartMinute, periodShow);
+        ShowWindow(g->hComboEndHour, periodShow);
+        ShowWindow(g->hComboEndMinute, periodShow);
+        g->periodFieldsShownApplied = periodShow;
+    }
     if (showPeriodFields) {
-        auto place = [](HWND h, D2D1_RECT_F r) {
+        auto place = [](HWND h, D2D1_RECT_F r, D2D1_RECT_F& applied) {
+            if (r.left == applied.left && r.top == applied.top && r.right == applied.right && r.bottom == applied.bottom) return;
             SetWindowPos(h, nullptr, (int)r.left, (int)r.top, (int)(r.right - r.left), (int)(r.bottom - r.top),
                 SWP_NOZORDER | SWP_NOACTIVATE);
+            applied = r;
         };
         // Dropdown-list combos need extra window height for the popup list itself —
-        // only the top sliver (matching the field rect) shows while closed.
-        auto placeCombo = [](HWND h, D2D1_RECT_F r) {
+        // only the top sliver (matching the field rect) shows while closed. Also
+        // guarded by the applied-rect check above: reapplying this (even with
+        // identical values) while the drop-down list is open closes it instantly,
+        // which is why an unrelated redraw (e.g. mouse hover elsewhere on the
+        // still-tracked, now-hidden schedule list underneath) used to yank the
+        // combo's drop-down away mid-selection.
+        auto placeCombo = [](HWND h, D2D1_RECT_F r, D2D1_RECT_F& applied) {
+            if (r.left == applied.left && r.top == applied.top && r.right == applied.right && r.bottom == applied.bottom) return;
             SetWindowPos(h, nullptr, (int)r.left, (int)r.top, (int)(r.right - r.left), 300, SWP_NOZORDER | SWP_NOACTIVATE);
+            applied = r;
         };
-        place(g->hEditLabel, g->rectFieldLabel);
-        place(g->hEditSubject, g->rectFieldSubject);
-        placeCombo(g->hComboStartHour, g->rectFieldStartHour);
-        placeCombo(g->hComboStartMinute, g->rectFieldStartMinute);
-        placeCombo(g->hComboEndHour, g->rectFieldEndHour);
-        placeCombo(g->hComboEndMinute, g->rectFieldEndMinute);
+        place(g->hEditLabel, g->rectFieldLabel, g->rectFieldLabelApplied);
+        place(g->hEditSubject, g->rectFieldSubject, g->rectFieldSubjectApplied);
+        placeCombo(g->hComboStartHour, g->rectFieldStartHour, g->rectFieldStartHourApplied);
+        placeCombo(g->hComboStartMinute, g->rectFieldStartMinute, g->rectFieldStartMinuteApplied);
+        placeCombo(g->hComboEndHour, g->rectFieldEndHour, g->rectFieldEndHourApplied);
+        placeCombo(g->hComboEndMinute, g->rectFieldEndMinute, g->rectFieldEndMinuteApplied);
     }
 
     bool showProfileName = g->savingProfile;
@@ -702,13 +749,25 @@ void syncNativeControls() {
     }
 
     // The memo is a permanent part of the layout (not a popup-triggered field),
-    // so it's always visible -- repositioned only when the target rect actually
-    // changes (resize/fullscreen toggle). Calling SetWindowPos unconditionally
-    // on every WM_PAINT caused a self-perpetuating repaint storm that starved
-    // WM_TIMER entirely (the child reposition was itself invalidating the
-    // WS_CLIPCHILDREN parent, queuing another WM_PAINT before the message loop
-    // ever got back around to the timer message).
+    // so it's normally always visible -- repositioned only when the target rect
+    // actually changes (resize/fullscreen toggle). Calling SetWindowPos
+    // unconditionally on every WM_PAINT caused a self-perpetuating repaint storm
+    // that starved WM_TIMER entirely (the child reposition was itself
+    // invalidating the WS_CLIPCHILDREN parent, queuing another WM_PAINT before
+    // the message loop ever got back around to the timer message).
+    // Exception: any of the other modal popups (period editor, save/load
+    // profile) darken the whole screen with a translucent Direct2D overlay,
+    // but the memo is a real child HWND -- it isn't part of that D2D surface,
+    // so it would otherwise keep rendering (and taking clicks) right through
+    // the overlay. Hide it while a modal is up.
+    bool anyModalOpen = g->editingPeriodIndex != -1 || g->savingProfile || g->loadingProfile;
     if (g->hRichMemo) {
+        int wantHidden = anyModalOpen ? 1 : 0;
+        if (wantHidden != g->memoHiddenApplied) {
+            ShowWindow(g->hRichMemo, anyModalOpen ? SW_HIDE : SW_SHOWNA);
+            g->memoHiddenApplied = wantHidden;
+        }
+        if (anyModalOpen) return;
         const D2D1_RECT_F& r = g->rectMemoEdit;
         D2D1_RECT_F& applied = g->rectMemoEditApplied;
         if (r.left != applied.left || r.top != applied.top || r.right != applied.right || r.bottom != applied.bottom) {
@@ -890,11 +949,17 @@ void insertMemoEmoji(const wchar_t* emoji) {
     SetFocus(g->hRichMemo);
 }
 
-// Canvas background follows the theme, and so does the *default* text color
-// (SCF_DEFAULT only affects new/unformatted typing, never touching whatever
-// explicit colors the user already picked via pickMemoColor) -- otherwise
-// freshly typed text stays RichEdit's built-in black default, which is
-// unreadable against the dark-mode background.
+// Canvas background follows the theme. Text color is forced across the whole
+// document (SCF_ALL), not just SCF_DEFAULT: RichEdit only honors SCF_DEFAULT
+// for typing into a genuinely empty document -- once any character exists,
+// new text typed next to it inherits THAT run's (possibly stale, wrong-theme)
+// color instead. Since the memo reloads saved content on every launch, it's
+// effectively never empty, so SCF_DEFAULT alone left both old AND newly
+// typed text stuck in whatever color it was saved in -- invisible against an
+// opposite-theme background. Trade-off: this also overwrites any per-run
+// color the user picked via pickMemoColor(false), since there's no cheap way
+// to tell "still-default" runs apart from "deliberately colored" ones without
+// walking the document run by run.
 void applyMemoTheme() {
     if (!g->hRichMemo) return;
     Palette pal = currentPalette();
@@ -906,7 +971,46 @@ void applyMemoTheme() {
     cf.cbSize = sizeof(cf);
     cf.dwMask = CFM_COLOR;
     cf.crTextColor = fg;
-    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf); // forward-typing baseline for a still-empty doc
+    SendMessageW(g->hRichMemo, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);     // and everything already on the page
+}
+
+// Plain Edit/ComboBox controls (period-editor fields, save-profile name field)
+// don't pick up the app's theme on their own -- they paint themselves via
+// system colors unless told otherwise. WM_CTLCOLOREDIT/WM_CTLCOLORLISTBOX
+// (handled in WndProc) cover the Edit fields' background/text; SetWindowTheme's
+// "DarkMode_CFD" class (needs the comctl32 v6 manifest dependency to take
+// effect) re-skins the ComboBoxes themselves, including their closed-state
+// display, which no CTLCOLOR message reaches for CBS_DROPDOWNLIST.
+void applyNativeControlsTheme() {
+    Palette pal = currentPalette();
+    if (g->hNativeCtlBgBrush) { DeleteObject(g->hNativeCtlBgBrush); g->hNativeCtlBgBrush = nullptr; }
+    COLORREF bg = RGB((BYTE)(pal.surface.r * 255), (BYTE)(pal.surface.g * 255), (BYTE)(pal.surface.b * 255));
+    g->hNativeCtlBgBrush = CreateSolidBrush(bg);
+
+    const wchar_t* comboTheme = isEffectivelyLight() ? L"Explorer" : L"DarkMode_CFD";
+    HWND combos[] = { g->hComboStartHour, g->hComboStartMinute, g->hComboEndHour, g->hComboEndMinute };
+    for (HWND h : combos) if (h) SetWindowTheme(h, comboTheme, nullptr);
+}
+
+// The memo is read-only in fullscreen, but a plain RichEdit still happily
+// takes focus and blinks a caret wherever you click -- distracting on a
+// clean student-facing display that should show only the written text and
+// emoji. Subclassing lets us swallow the clicks/focus that would otherwise
+// place that caret, without touching the control's normal windowed behavior.
+LRESULT CALLBACK RichMemoSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g->fullscreen) {
+        switch (msg) {
+        case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_RBUTTONUP:
+            return 0; // no click-to-place-caret while fullscreen
+        case WM_SETFOCUS:
+            HideCaret(hwnd);
+            SetFocus(GetParent(hwnd)); // bounce focus straight back to the main window
+            return 0;
+        }
+    }
+    return CallWindowProcW(g->richMemoDefaultProc, hwnd, msg, wParam, lParam);
 }
 
 // ---- Main frame ----
@@ -979,24 +1083,31 @@ void drawFrame(HWND hwnd) {
         roundedRect(g->rectSaveIcon, 10, hex(kHyoBlue, 0.12f));
         text(L"", g->rectSaveIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        // Left side: exam-type selector (모의고사 / 지필평가) — narrowed from the
-        // original 140px, which was much wider than the 4-character labels need.
+        // Left side toolbar boxes, all one uniform width/gap: exam-type tabs
+        // (모의고사 / 지필평가) → 화면구성 (구 "표시") → 시간 기준 선택, in that order.
+        constexpr float kToolboxW = 130;
         g->scheduleButtons.clear();
         float bx = pad;
         for (auto& sc : g->scheduleStore.all()) {
-            float bw = 104;
-            D2D1_RECT_F r = D2D1::RectF(bx, iconTop, bx + bw, iconTop + iconSize);
+            D2D1_RECT_F r = D2D1::RectF(bx, iconTop, bx + kToolboxW, iconTop + iconSize);
             bool isActive = sc.id == g->scheduleStore.activeId();
             roundedRect(r, 10, isActive ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f), isActive ? nullptr : &pal.cardBorder);
             text(sc.name, r, g->fmtSmall, isActive ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
             g->scheduleButtons.push_back({ r, sc.id });
-            bx += bw + iconGap;
+            bx += kToolboxW + iconGap;
         }
 
-        // Time-source dropdown button, right after the exam-type buttons.
-        bx += iconGap;
-        float dropdownW = 150;
-        g->rectTimeSourceButton = D2D1::RectF(bx, iconTop, bx + dropdownW, iconTop + iconSize);
+        // 화면구성 (fullscreen display-toggle) button, right after the exam-type tabs.
+        g->rectDisplaySettingsButton = D2D1::RectF(bx, iconTop, bx + kToolboxW, iconTop + iconSize);
+        roundedRect(g->rectDisplaySettingsButton, 10,
+            g->displaySettingsOpen ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f),
+            g->displaySettingsOpen ? nullptr : &pal.cardBorder);
+        text(L"화면구성", g->rectDisplaySettingsButton, g->fmtSmall,
+            g->displaySettingsOpen ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+        bx += kToolboxW + iconGap;
+
+        // Time-source dropdown button, right after 화면구성.
+        g->rectTimeSourceButton = D2D1::RectF(bx, iconTop, bx + kToolboxW, iconTop + iconSize);
         roundedRect(g->rectTimeSourceButton, 10, hex(kHyoBlue, 0.10f), &pal.cardBorder);
         text(kTimeSources[g->settings.timeSourceIndex].label,
             D2D1::RectF(g->rectTimeSourceButton.left + 14, g->rectTimeSourceButton.top,
@@ -1005,16 +1116,6 @@ void drawFrame(HWND hwnd) {
         text(L"", D2D1::RectF(g->rectTimeSourceButton.right - 26, g->rectTimeSourceButton.top,
                 g->rectTimeSourceButton.right - 4, g->rectTimeSourceButton.bottom),
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        // Fullscreen display-toggle button, right after the time-source dropdown.
-        bx += dropdownW + iconGap;
-        float displayBtnW = 88;
-        g->rectDisplaySettingsButton = D2D1::RectF(bx, iconTop, bx + displayBtnW, iconTop + iconSize);
-        roundedRect(g->rectDisplaySettingsButton, 10,
-            g->displaySettingsOpen ? hex(kHyoBlue, 0.22f) : hex(kHyoBlue, 0.10f),
-            g->displaySettingsOpen ? nullptr : &pal.cardBorder);
-        text(L"표시", g->rectDisplaySettingsButton, g->fmtSmall,
-            g->displaySettingsOpen ? hex(kHyoBlue) : pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         // Fullscreen still exposes one unobtrusive "return to window" icon,
         // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
@@ -1073,13 +1174,17 @@ void drawFrame(HWND hwnd) {
     // for narrower card ratios / aspect ratios (it doesn't know the card width
     // yet). Re-check against the real left-card width here and shrink if needed
     // — this is what actually prevents the "HH:MM:SS" line from wrapping/clipping.
+    // Re-derived from fsClockBaseSize (the height-only baseline), not from
+    // fClock's current size — otherwise toggling the 표시 schedule panel off
+    // (freeing up width) could never grow the clock back, only ever shrink it
+    // further on each round trip.
     if (g->fullscreen) {
         float cardWidth = leftCard.right - leftCard.left;
         if (g->fsClockCorrectedForWidth != cardWidth) {
             const float kClockCharCount = 8.0f;      // "HH:MM:SS"
             const float kClockAdvanceEm = 0.58f;     // approx. digit advance as a fraction of em, Malgun Gothic Bold
             float widthFitSize = (cardWidth * 0.92f) / (kClockCharCount * kClockAdvanceEm);
-            float appliedSize = std::min(fClock->GetFontSize(), std::clamp(widthFitSize, 60.0f, 520.0f));
+            float appliedSize = std::min(g->fsClockBaseSize, std::clamp(widthFitSize, 60.0f, 520.0f));
             if (appliedSize != fClock->GetFontSize()) {
                 fClock->Release();
                 fClock = makeFormat(kUiFontFamily, appliedSize, DWRITE_FONT_WEIGHT_BOLD);
@@ -1236,7 +1341,7 @@ void drawFrame(HWND hwnd) {
         // floating in a mostly-empty box; windowed mode keeps its fixed sizes.
         if (g->fullscreen && g->fsPeriodBuiltForRowH != rowH) buildPeriodRowFonts(rowH);
         IDWriteTextFormat* rowTitleFmt = g->fullscreen ? g->fmtPeriodTitleFS : fBody;
-        IDWriteTextFormat* rowTimeFmt = g->fullscreen ? g->fmtPeriodTimeFS : fSmall;
+        IDWriteTextFormat* rowTimeFmt = g->fullscreen ? g->fmtPeriodTimeFS : g->fmtPeriodTimeWin;
         // Small fixed gap between period rows — a little breathing room without
         // eating into the now-uncapped fullscreen row height.
         float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
@@ -1284,20 +1389,30 @@ void drawFrame(HWND hwnd) {
             // 14px left inset (tuned for the compact windowed list) reads as
             // cramped against the card edge -- scale it up for fullscreen.
             float textLeft = row.left + (g->fullscreen ? 40.0f : 14.0f);
-            float textRight = !g->fullscreen ? row.right - 46 : row.right - 32;
+            float textRight;
+            if (g->fullscreen) {
+                textRight = row.right - 32;
+            } else {
+                // Windowed 교시/시간 text is deliberately narrower than the row
+                // itself -- half of the old full-row width, left-aligned.
+                float fullTextRight = row.right - 46;
+                textRight = textLeft + (fullTextRight - textLeft) / 2.0f;
+            }
 
             // The height-only guess in buildPeriodRowFonts() can size the time
             // line too wide for narrower cards (it doesn't know the row width
             // yet); re-check against the real available width here and shrink
             // if needed so "HH:MM ~ HH:MM(NN분)" never wraps to a second line,
             // while leaving the little right margin textRight already reserves.
+            // Re-derived from fsPeriodTimeBaseSize (the height-only baseline),
+            // same grow-back reasoning as the clock's fsClockBaseSize above.
             if (g->fullscreen) {
                 float availWidth = textRight - textLeft;
                 if (g->fsPeriodTimeCorrectedForWidth != availWidth) {
                     const float kTimeCharCount = 19.0f;  // "00:00 ~ 00:00(999분)" worst case
                     const float kTimeAdvanceEm = 0.56f;  // approx. advance width as a fraction of em
                     float widthFitSize = availWidth / (kTimeCharCount * kTimeAdvanceEm);
-                    float appliedSize = std::min(rowTimeFmt->GetFontSize(), std::clamp(widthFitSize, 16.0f, 110.0f));
+                    float appliedSize = std::min(g->fsPeriodTimeBaseSize, std::clamp(widthFitSize, 16.0f, 110.0f));
                     if (appliedSize != rowTimeFmt->GetFontSize()) {
                         rowTimeFmt->Release();
                         rowTimeFmt = makeFormat(kUiFontFamily, appliedSize, DWRITE_FONT_WEIGHT_MEDIUM);
@@ -1455,6 +1570,12 @@ void toggleFullscreen(HWND hwnd) {
         g->savingProfile = false;
         g->loadingProfile = false;
         g->fullscreenIconLastMoveMs = 0; // return icon starts hidden until the mouse actually moves
+        // If the memo had focus (mid-edit right before hitting fullscreen), its
+        // caret would otherwise keep blinking underneath the now-read-only control.
+        if (g->hRichMemo && GetFocus() == g->hRichMemo) {
+            HideCaret(g->hRichMemo);
+            SetFocus(hwnd);
+        }
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g->prevPlacement);
@@ -1675,9 +1796,19 @@ void loadProfileByIndex(int idx) {
     SavedProfile& sp = g->profiles[idx];
     applySettingsSnapshotJson(sp.settingsJson);
     g->scheduleStore.fromJson(sp.schedulesJson);
+    // fromJson resets the active schedule from the profile's own JSON -- mirror
+    // that back into settings so the persisted activeScheduleId doesn't drift
+    // from what's actually shown (it's read back on next launch).
+    g->settings.activeScheduleId = g->scheduleStore.activeId();
     g->settings.save();
     g->scheduleStore.saveToFile(g->dataPath);
     g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);
+    // A loaded profile can carry a different theme -- the memo box and the
+    // native Edit/ComboBox controls only recolor when explicitly told to (the
+    // theme toggle does this; loading a profile must too, or they keep the old
+    // theme's colors until the next manual toggle).
+    applyMemoTheme();
+    applyNativeControlsTheme();
 }
 
 void deleteProfileAt(int idx) {
@@ -1721,6 +1852,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g->hComboStartMinute = makeCombo(kIdComboStartMinute, 60);
         g->hComboEndHour = makeCombo(kIdComboEndHour, 24);
         g->hComboEndMinute = makeCombo(kIdComboEndMinute, 60);
+        applyNativeControlsTheme();
 
         // Free-write memo under the clock. Msftedit.dll registers RICHEDIT50W;
         // must be loaded before this CreateWindowExW call.
@@ -1728,8 +1860,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g->hRichMemo = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL | ES_AUTOVSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)kIdRichMemo, hInst, nullptr);
-        applyMemoTheme();
+        g->richMemoDefaultProc = (WNDPROC)SetWindowLongPtrW(g->hRichMemo, GWLP_WNDPROC, (LONG_PTR)RichMemoSubclassProc);
+        // Theme applied AFTER load: EM_STREAMIN (inside loadMemoRtf) replaces the
+        // whole document, which would otherwise wipe out the SCF_ALL recolor below.
         loadMemoRtf();
+        applyMemoTheme();
 
         return 0;
     }
@@ -1761,6 +1896,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g->renderTarget->Resize(D2D1::SizeU(w, h));
         }
         return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        // Edit fields (교시명/과목/저장 이름) and ComboBox drop-down lists --
+        // give them the current theme's colors instead of the system default
+        // white background / black text, which stands out badly in dark mode.
+        Palette pal = currentPalette();
+        HDC hdc = (HDC)wParam;
+        COLORREF bg = RGB((BYTE)(pal.surface.r * 255), (BYTE)(pal.surface.g * 255), (BYTE)(pal.surface.b * 255));
+        COLORREF fg = RGB((BYTE)(pal.textPrimary.r * 255), (BYTE)(pal.textPrimary.g * 255), (BYTE)(pal.textPrimary.b * 255));
+        SetBkColor(hdc, bg);
+        SetTextColor(hdc, fg);
+        return (LRESULT)g->hNativeCtlBgBrush;
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ LOWORD(lParam), HIWORD(lParam) };
@@ -1826,6 +1974,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g->settings.theme = isEffectivelyLight() ? Theme::Dark : Theme::Light;
             g->settings.save();
             applyMemoTheme();
+            applyNativeControlsTheme();
         } else if (!g->fullscreen && ptInRect(pt, g->rectAddPeriod)) {
             openPeriodEditor(-2);
         } else if (!g->fullscreen && ptInRect(pt, g->rectMemoBold)) {
@@ -1887,7 +2036,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g->cursorHiddenInFullscreen = false;
             }
         }
-        if (g->pendingIsPeriodClick) {
+        // The period list/site-link/etc. sit underneath whatever modal (period
+        // editor, save/load profile) is currently up -- their rects are stale
+        // (from the last draw before the modal opened) and irrelevant while it's
+        // open, so skip hit-testing them entirely. This isn't just correctness:
+        // an unrelated hover toggle here would InvalidateRect -> repaint ->
+        // syncNativeControls, which used to yank focus/close whatever native
+        // control (e.g. an open combo drop-down) the modal itself owns.
+        bool anyModalOpen = g->editingPeriodIndex != -1 || g->savingProfile || g->loadingProfile;
+
+        if (!anyModalOpen && g->pendingIsPeriodClick) {
             int dx = pt.x - g->mouseDownPt.x, dy = pt.y - g->mouseDownPt.y;
             if (!g->isDraggingPeriod && (std::abs(dx) > 6 || std::abs(dy) > 6)) {
                 g->isDraggingPeriod = true;
@@ -1902,7 +2060,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
 
-        if (!g->fullscreen && !g->isDraggingPeriod) {
+        if (!anyModalOpen && !g->fullscreen && !g->isDraggingPeriod) {
             int newHover = -1;
             for (size_t i = 0; i < g->periodRowRects.size(); i++) {
                 if (ptInRect(pt, g->periodRowRects[i])) { newHover = (int)i; break; }
@@ -1925,7 +2083,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         {
-            bool nowHovered = !g->fullscreen && ptInRect(pt, g->rectSiteLink);
+            bool nowHovered = !anyModalOpen && !g->fullscreen && ptInRect(pt, g->rectSiteLink);
             if (nowHovered != g->hoveredSiteLink) {
                 g->hoveredSiteLink = nowHovered;
                 InvalidateRect(hwnd, nullptr, FALSE);

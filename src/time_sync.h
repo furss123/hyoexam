@@ -1,8 +1,10 @@
 // Keeps a running offset between the local system clock and a real time
-// server (SNTP, UDP/123), refreshed on a background thread every 10s so the
+// server (SNTP, UDP/123), refreshed on a background thread every 3s so the
 // on-screen clock tracks an authoritative source instead of a possibly-
-// drifted local clock. Falls back silently to the system clock whenever a
-// sync request fails (no network, DNS hiccup, etc). The server host can be
+// drifted local clock. start() also does one blocking fetch before returning,
+// so the app opens already synced instead of showing "동기화 대기중" for the
+// first frame. Falls back silently to the system clock whenever a sync
+// request fails (no network, DNS hiccup, etc). The server host can be
 // switched at runtime (see the time-source dropdown in the toolbar).
 #pragma once
 #include <atomic>
@@ -22,7 +24,7 @@ public:
     void stop();
 
     // Changes which server to sync against; takes effect on the next tick
-    // (within ~10s) and immediately marks the offset as unsynced.
+    // (within ~3s) and immediately marks the offset as unsynced.
     void setHost(const std::wstring& host);
 
     // Current wall-clock time = system time + last-known offset to the server.
