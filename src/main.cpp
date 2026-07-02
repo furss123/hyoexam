@@ -1431,7 +1431,10 @@ void drawFrame(HWND hwnd) {
             // the period's whole visual block now.
             float titleH = rowTitleFmt->GetFontSize() * 1.3f;
             float timeH = rowTimeFmt->GetFontSize() * 1.3f;
-            float lineGap = rowTitleFmt->GetFontSize() * 0.22f;
+            // Fixed 3pt gap between the 교시/과목 title and the time line, in both
+            // windowed and fullscreen (was font-size-proportional, which opened up
+            // to 20pt+ on the large fullscreen fonts).
+            float lineGap = 3.0f;
             float titleTop = g->fullscreen
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
