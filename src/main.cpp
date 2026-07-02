@@ -1431,7 +1431,7 @@ void drawFrame(HWND hwnd) {
             // the period's whole visual block now.
             float titleH = rowTitleFmt->GetFontSize() * 1.3f;
             float timeH = rowTimeFmt->GetFontSize() * 1.3f;
-            float lineGap = rowTitleFmt->GetFontSize() * 0.22f;
+            float lineGap = rowTitleFmt->GetFontSize() * (g->fullscreen ? 0.11f : 0.22f);
             float titleTop = g->fullscreen
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
