@@ -23,6 +23,10 @@
 #include "settings.h"
 #include "time_sync.h"
 
+#ifdef _MSC_VER
+#pragma execution_character_set("utf-8")
+#endif
+
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -50,9 +54,9 @@ constexpr int kIdComboEndMinute = 109;
 constexpr int kIdEditProfileName = 110;
 constexpr int kIdRichMemo = 111;
 
-// Malgun Gothic ships with every Windows 10/11 install (it's the OS's own
-// Korean UI font) — no bundling, no missing-font fallback surprises.
-constexpr wchar_t kUiFontFamily[] = L"맑은 고딕";
+// Use the invariant English family name so font lookup works regardless of OS
+// display language/locale. ("맑은 고딕" can fail to resolve on non-Korean setups.)
+constexpr wchar_t kUiFontFamily[] = L"Malgun Gothic";
 
 // Time servers the clock can sync against (SNTP, UDP/123). Index persisted
 // in Settings::timeSourceIndex.
@@ -1825,7 +1829,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
         g->hUiFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH, L"맑은 고딕");
+            DEFAULT_PITCH, kUiFontFamily);
 
         auto makeEdit = [&](int id, DWORD extraStyle) {
             HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
