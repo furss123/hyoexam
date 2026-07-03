@@ -33,7 +33,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.3";
+constexpr wchar_t kAppVersion[] = L"1.0.4";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
@@ -439,36 +439,72 @@ void text(const std::wstring& s, D2D1_RECT_F r, IDWriteTextFormat* fmt, D2D1_COL
     g->renderTarget->DrawText(s.c_str(), (UINT32)s.size(), fmt, r, brush(color));
 }
 
-// Draws `s` on a single non-wrapping line inside the fixed box [x,top]..[right,top+boxH],
-// shrinking the font from baseFmt's size only as much as needed to fit the width
-// (never grows past it). The box height stays constant regardless of the fitted
-// size, so neighboring lines never reflow — this is what keeps the period rows'
-// layout ("문단") stable as subject/time text gets longer. `weight` must match
-// baseFmt so the shrunk format renders in the same face.
-void drawFittedLine(const std::wstring& s, float x, float top, float right, float boxH,
-                    IDWriteTextFormat* baseFmt, DWRITE_FONT_WEIGHT weight, D2D1_COLOR_F color) {
-    float maxW = right - x;
-    float baseSize = baseFmt->GetFontSize();
+// Builds a top-aligned (NEAR), non-wrapping single-line layout for `s` at
+// `baseSize`, shrunk only as far as needed to fit `maxW`. Returns the layout
+// (caller releases) and the applied size via outSize. Top-aligned so the line
+// sits at the draw origin's y — lets the caller place it by exact pixels.
+IDWriteTextLayout* makeFittedLayout(const std::wstring& s, float baseSize,
+                                    DWRITE_FONT_WEIGHT weight, float maxW, float& outSize) {
     float size = baseSize;
-    if (!s.empty() && maxW > 0) {
+    auto build = [&](float sz) -> IDWriteTextLayout* {
+        IDWriteTextFormat* fmt = makeFormat(kUiFontFamily, sz, weight);
+        fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         IDWriteTextLayout* layout = nullptr;
-        if (SUCCEEDED(g->dwriteFactory->CreateTextLayout(
-                s.c_str(), (UINT32)s.size(), baseFmt, 1e6f, 1e6f, &layout)) && layout) {
-            DWRITE_TEXT_METRICS m{};
-            layout->GetMetrics(&m);
+        g->dwriteFactory->CreateTextLayout(s.c_str(), (UINT32)s.size(), fmt, 1e6f, 1e6f, &layout);
+        fmt->Release();
+        return layout;
+    };
+    IDWriteTextLayout* layout = build(size);
+    if (layout && maxW > 0 && !s.empty()) {
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        if (m.width > maxW && m.width > 0.0f) {
+            size = baseSize * (maxW / m.width);
             layout->Release();
-            if (m.width > maxW && m.width > 0.0f) size = baseSize * (maxW / m.width);
+            layout = build(size);
         }
     }
-    D2D1_RECT_F box = D2D1::RectF(x, top, right, top + boxH);
-    if (size == baseSize) {
-        text(s, box, baseFmt, color);
-        return;
-    }
-    IDWriteTextFormat* fmt = makeFormat(kUiFontFamily, size, weight);
-    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-    text(s, box, fmt, color);
-    fmt->Release();
+    outSize = size;
+    return layout;
+}
+
+// Draws the 교시/과목 title above the 시간 time line in the column [x..right],
+// each shrunk to fit the width on one line, positioned so the *visible* gap
+// between the title's baseline and the time's cap-top is exactly `inkGap` DIP
+// (not the font's ascent/descent whitespace). The two-line block's ink is
+// vertically centered on centerY. Uses each line's real DirectWrite baseline
+// metric, so the gap is correct regardless of font size or weight.
+void drawPeriodTextBlock(const std::wstring& title, const std::wstring& time,
+                         float x, float right, float centerY,
+                         float titleSize, DWRITE_FONT_WEIGHT titleW, D2D1_COLOR_F titleColor,
+                         float timeSize, DWRITE_FONT_WEIGHT timeW, D2D1_COLOR_F timeColor,
+                         float inkGap) {
+    float maxW = right - x;
+    float ts = titleSize, ms = timeSize;
+    IDWriteTextLayout* tl = makeFittedLayout(title, titleSize, titleW, maxW, ts);
+    IDWriteTextLayout* ml = makeFittedLayout(time, timeSize, timeW, maxW, ms);
+    if (!tl || !ml) { if (tl) tl->Release(); if (ml) ml->Release(); return; }
+
+    DWRITE_LINE_METRICS tlm{}, mlm{}; UINT32 cnt = 0;
+    tl->GetLineMetrics(&tlm, 1, &cnt);
+    ml->GetLineMetrics(&mlm, 1, &cnt);
+    const float kCap = 0.72f; // digit/Hangul cap height as a fraction of em (approx)
+
+    // Origins (line-tops) with title at ty=0, time below it so the time's ink
+    // top sits inkGap under the title's baseline.
+    float ty = 0.0f;
+    float titleBaseline = ty + tlm.baseline;            // title ink bottom ≈ baseline
+    float my = titleBaseline + inkGap - (mlm.baseline - kCap * ms); // time ink top = its baseline − cap
+    // Center the block's ink extent (title cap-top … time baseline) on centerY.
+    float inkTop = ty + tlm.baseline - kCap * ts;
+    float inkBottom = my + mlm.baseline;
+    float offset = centerY - (inkTop + inkBottom) * 0.5f;
+
+    g->renderTarget->DrawTextLayout(D2D1::Point2F(x, ty + offset), tl, brush(titleColor));
+    g->renderTarget->DrawTextLayout(D2D1::Point2F(x, my + offset), ml, brush(timeColor));
+    tl->Release();
+    ml->Release();
 }
 
 std::wstring formatClock(const SYSTEMTIME& st) {
@@ -1401,25 +1437,17 @@ void drawFrame(HWND hwnd) {
         // Small fixed gap between period rows — a little breathing room without
         // eating into the now-uncapped fullscreen row height.
         float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
-        // Line boxes hug the glyphs tightly (kBox close to 1) so the 교시↔시간
-        // gap is dominated by the explicit 1mm lineGap rather than line-leading
-        // whitespace. If title+gap+time would overrun the row height, shrink both
-        // sizes uniformly (keeping their ratio) so the block still fits.
-        constexpr float kBox = 1.0f; // box == glyph em: no extra leading, so the gap ≈ lineGap
-        float lineGap = 1.0f * kDipPerMm; // 교시↔시간 간격: 1mm
+        // Target ink gap between the 교시 baseline and the 시간 cap-top: 1mm.
+        float periodInkGap = 1.0f * kDipPerMm;
+        // Keep the pair inside the row: shrink both sizes uniformly if their
+        // (conservative, full-em) stacked height would exceed the row height.
         float availBlockH = rowH - rowGapPx;
-        if ((titleBaseSize + timeBaseSize) * kBox + lineGap > availBlockH) {
-            float s = std::max(0.05f, availBlockH - lineGap) / ((titleBaseSize + timeBaseSize) * kBox);
+        float emBlockH = titleBaseSize + timeBaseSize + periodInkGap;
+        if (emBlockH > availBlockH && emBlockH > 0.0f) {
+            float s = std::max(0.05f, availBlockH / emBlockH);
             titleBaseSize *= s;
             timeBaseSize *= s;
         }
-        float titleH = titleBaseSize * kBox;
-        float timeH = timeBaseSize * kBox;
-        float blockH = titleH + lineGap + timeH;
-        IDWriteTextFormat* titleBaseFmt = makeFormat(kUiFontFamily, titleBaseSize, titleWeight);
-        titleBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        IDWriteTextFormat* timeBaseFmt = makeFormat(kUiFontFamily, timeBaseSize, timeWeight);
-        timeBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
         g->periodRowRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
         g->periodDeleteRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
@@ -1469,21 +1497,20 @@ void drawFrame(HWND hwnd) {
             // only shrinks (adaptively) for unusually long text.
             float textRight = g->fullscreen ? row.right - 40.0f : row.right - 52.0f;
 
-            // titleH/timeH/blockH/lineGap were computed once before the loop (they
-            // don't depend on per-row data). The whole title+time block is centered
-            // in the row with equal top/bottom margin (교시·시간 여백 일치); the two
-            // lines share one left edge (textLeft) and one right edge (textRight).
-            float titleTop = row.top + (rowH - rowGapPx - blockH) / 2.0f;
-            float timeTop = titleTop + titleH + lineGap;
-            // Time/subject colors swapped from the original design: the period
-            // time now carries the stronger (primary) color and the label/subject
-            // the softer (secondary) one -- matches how this schedule is actually
-            // scanned (time first). Each line auto-shrinks to fit textRight. The
-            // time line drops the spaces around "~" for a tighter "09:00~09:50".
-            drawFittedLine(p.label + L" " + p.subject, textLeft, titleTop, textRight, titleH,
-                titleBaseFmt, titleWeight, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
-            drawFittedLine(p.start.format() + L"~" + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                textLeft, timeTop, textRight, timeH, timeBaseFmt, timeWeight, pal.textPrimary);
+            // The title+time pair is centered as one block on the row's vertical
+            // center (교시·시간 여백 일치), sharing one left/right edge, with a
+            // precise 1mm ink gap between them (see drawPeriodTextBlock). Colors
+            // swapped from the original: time carries the stronger primary color,
+            // the label/subject the softer secondary one. The time line drops the
+            // spaces around "~" for a tighter "09:00~09:50".
+            float centerY = row.top + (rowH - rowGapPx) * 0.5f;
+            drawPeriodTextBlock(
+                p.label + L" " + p.subject,
+                p.start.format() + L"~" + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
+                textLeft, textRight, centerY,
+                titleBaseSize, titleWeight, isCurrent ? hex(kHyoBlue) : pal.textSecondary,
+                timeBaseSize, timeWeight, pal.textPrimary,
+                periodInkGap);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
@@ -1497,8 +1524,6 @@ void drawFrame(HWND hwnd) {
 
             ry += rowH;
         }
-        titleBaseFmt->Release();
-        timeBaseFmt->Release();
 
         if (!g->fullscreen) {
             g->rectAddPeriod = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + rowH - rowGapPx);
