@@ -19,9 +19,6 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 
 #include "schedule.h"
 #include "settings.h"
@@ -1467,14 +1464,14 @@ void drawFrame(HWND hwnd) {
                 roundedRect(row, 12, hex(kHyoBlue, 0.09f), &pal.cardBorder);
             }
 
-            // Two-tier card, per the reference layout: an accent header pill
-            // ("1교시 (08:40~10:00)") overlapping the top of a larger content box
-            // ("국어(80분)") below it -- the header is drawn last so it visually
-            // sits in front of the content box's top corners, tab-style.
+            // Two-tier card: an accent header pill ("1교시 (08:40~10:00)") above
+            // a larger content box ("국어(80분)") below it, separated by a fixed
+            // 3mm gap (previously the header overlapped the content, tab-style;
+            // now they're two distinct boxes with a small, exact gap).
             float headerH = std::clamp((rowH - rowGapPx) * 0.30f, 22.0f, 110.0f);
-            float overlap = headerH * 0.22f;
+            float headerContentGap = 3.0f * kDipPerMm;
             D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + headerH);
-            D2D1_RECT_F content = D2D1::RectF(row.left, row.top + headerH - overlap, row.right, row.bottom);
+            D2D1_RECT_F content = D2D1::RectF(row.left, header.bottom + headerContentGap, row.right, row.bottom);
             float radius = g->fullscreen ? 14.0f : 10.0f;
 
             D2D1_COLOR_F contentFill = isCurrent ? hex(kHyoBlue, 0.14f) : pal.surface;
@@ -1486,9 +1483,10 @@ void drawFrame(HWND hwnd) {
 
             float insetX = g->fullscreen ? 20.0f : 10.0f;
             D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
-            D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top + overlap, content.right - insetX, content.bottom);
+            D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
-            float headerFontSize = std::clamp(headerH * 0.44f, 12.0f, 56.0f);
+            // Header (교시+시간) text is 1.3x its previous size, per request.
+            float headerFontSize = std::clamp(headerH * 0.44f, 12.0f, 56.0f) * 1.3f;
             float contentFontSize = std::clamp((contentBox.bottom - contentBox.top) * 0.40f, 14.0f, 110.0f);
 
             drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
@@ -2219,44 +2217,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// Shared race state for raceTimeSources(), heap-allocated (via shared_ptr) so
-// the detached probe threads can safely outlive the function call that
-// started them -- only the last thread to finish actually frees it.
-struct TimeRaceState {
-    std::mutex mtx;
-    std::condition_variable cv;
-    int winner = -1;
-    int completed = 0;
-};
-
-// Probes every configured time source concurrently and returns the index of
-// whichever answers first (successfully), instead of committing up-front to
-// one (possibly slow or unreachable) fixed source. Returns as soon as a
-// winner is found (or all have failed) -- the still-racing losers are
-// detached and finish on their own, bounded by their own socket timeout.
-int raceTimeSources() {
-    auto state = std::make_shared<TimeRaceState>();
-    std::vector<std::thread> threads;
-    for (int i = 0; i < kTimeSourceCount; i++) {
-        threads.emplace_back([i, state]() {
-            long long offset = 0;
-            bool ok = TimeSync::fetchSntpOffset(kTimeSources[i].host, offset);
-            std::lock_guard<std::mutex> lock(state->mtx);
-            if (ok && state->winner == -1) state->winner = i;
-            state->completed++;
-            state->cv.notify_all();
-        });
-    }
-    int winner;
-    {
-        std::unique_lock<std::mutex> lock(state->mtx);
-        state->cv.wait(lock, [&] { return state->winner != -1 || state->completed == kTimeSourceCount; });
-        winner = state->winner;
-    }
-    for (auto& t : threads) t.detach();
-    return winner;
-}
-
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
@@ -2269,15 +2229,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     if (!g->settings.activeScheduleId.empty()) g->scheduleStore.setActive(g->settings.activeScheduleId);
     loadProfilesFromDisk();
 
-    if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
-    // Race all 3 time sources concurrently and adopt whichever answers first,
-    // instead of committing to a single (possibly slow/unreachable) fixed
-    // source -- redone on every launch since network conditions change.
-    int fastest = raceTimeSources();
-    if (fastest >= 0 && fastest != g->settings.timeSourceIndex) {
-        g->settings.timeSourceIndex = fastest;
-        g->settings.save();
+    // Always start synced against KRISS (한국표준과학연구원) specifically, per
+    // request -- overrides whatever time source was last selected/saved.
+    // (The toolbar dropdown can still switch sources afterward as before.)
+    int krissIndex = 0;
+    for (int i = 0; i < kTimeSourceCount; i++) {
+        if (std::wcscmp(kTimeSources[i].host, L"ntp.kriss.re.kr") == 0) { krissIndex = i; break; }
     }
+    g->settings.timeSourceIndex = krissIndex;
+    g->settings.save();
     g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);
     g->timeSync.start();
 
