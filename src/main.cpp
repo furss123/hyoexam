@@ -33,7 +33,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.2";
+constexpr wchar_t kAppVersion[] = L"1.0.3";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
@@ -1389,22 +1389,37 @@ void drawFrame(HWND hwnd) {
         // line then shrinks from here only as far as needed to fit its width, via
         // drawFittedLine, so long subject/time text never wraps or reflows the row.
         DWRITE_FONT_WEIGHT titleWeight = g->fullscreen ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_MEDIUM;
-        DWRITE_FONT_WEIGHT timeWeight = g->fullscreen ? DWRITE_FONT_WEIGHT_MEDIUM : DWRITE_FONT_WEIGHT_NORMAL;
+        DWRITE_FONT_WEIGHT timeWeight = DWRITE_FONT_WEIGHT_BOLD; // 시간 줄은 굵게
         float titleBaseSize, timeBaseSize;
         if (g->fullscreen) {
             titleBaseSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f) - 5.0f;
-            timeBaseSize = std::clamp(rowH * 0.30f, 18.0f, 110.0f) + 10.0f;
+            timeBaseSize = (std::clamp(rowH * 0.30f, 18.0f, 110.0f) + 10.0f) * 1.3f;
         } else {
-            titleBaseSize = 15.0f; // 과목/교시: windowed 20pt − 5pt
-            timeBaseSize = 35.0f;  // 시간: windowed 25pt + 10pt
+            titleBaseSize = 15.0f;        // 과목/교시: windowed 20pt − 5pt
+            timeBaseSize = 35.0f * 1.3f;  // 시간: 기존 35pt의 1.3배
         }
+        // Small fixed gap between period rows — a little breathing room without
+        // eating into the now-uncapped fullscreen row height.
+        float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
+        // Line boxes hug the glyphs tightly (kBox close to 1) so the 교시↔시간
+        // gap is dominated by the explicit 1mm lineGap rather than line-leading
+        // whitespace. If title+gap+time would overrun the row height, shrink both
+        // sizes uniformly (keeping their ratio) so the block still fits.
+        constexpr float kBox = 1.0f; // box == glyph em: no extra leading, so the gap ≈ lineGap
+        float lineGap = 1.0f * kDipPerMm; // 교시↔시간 간격: 1mm
+        float availBlockH = rowH - rowGapPx;
+        if ((titleBaseSize + timeBaseSize) * kBox + lineGap > availBlockH) {
+            float s = std::max(0.05f, availBlockH - lineGap) / ((titleBaseSize + timeBaseSize) * kBox);
+            titleBaseSize *= s;
+            timeBaseSize *= s;
+        }
+        float titleH = titleBaseSize * kBox;
+        float timeH = timeBaseSize * kBox;
+        float blockH = titleH + lineGap + timeH;
         IDWriteTextFormat* titleBaseFmt = makeFormat(kUiFontFamily, titleBaseSize, titleWeight);
         titleBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         IDWriteTextFormat* timeBaseFmt = makeFormat(kUiFontFamily, timeBaseSize, timeWeight);
         timeBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        // Small fixed gap between period rows — a little breathing room without
-        // eating into the now-uncapped fullscreen row height.
-        float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
 
         g->periodRowRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
         g->periodDeleteRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
@@ -1454,25 +1469,20 @@ void drawFrame(HWND hwnd) {
             // only shrinks (adaptively) for unusually long text.
             float textRight = g->fullscreen ? row.right - 40.0f : row.right - 52.0f;
 
-            // Fixed line-box heights derived from the *base* sizes (not the fitted
-            // ones), so a line shrinking to fit its width never changes the row's
-            // vertical layout. In fullscreen the whole title+time block is centered
+            // titleH/timeH/blockH/lineGap were computed once before the loop (they
+            // don't depend on per-row data). The whole title+time block is centered
             // in the row with equal top/bottom margin (교시·시간 여백 일치); the two
             // lines share one left edge (textLeft) and one right edge (textRight).
-            float titleH = titleBaseSize * 1.3f;
-            float timeH = timeBaseSize * 1.3f;
-            float lineGap = 3.0f; // fixed 3pt gap between 교시/과목 title and time line
-            float titleTop = g->fullscreen
-                ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
-                : row.top + rowH * 0.10f;
+            float titleTop = row.top + (rowH - rowGapPx - blockH) / 2.0f;
             float timeTop = titleTop + titleH + lineGap;
             // Time/subject colors swapped from the original design: the period
             // time now carries the stronger (primary) color and the label/subject
             // the softer (secondary) one -- matches how this schedule is actually
-            // scanned (time first). Each line auto-shrinks to fit textRight.
+            // scanned (time first). Each line auto-shrinks to fit textRight. The
+            // time line drops the spaces around "~" for a tighter "09:00~09:50".
             drawFittedLine(p.label + L" " + p.subject, textLeft, titleTop, textRight, titleH,
                 titleBaseFmt, titleWeight, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
-            drawFittedLine(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
+            drawFittedLine(p.start.format() + L"~" + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
                 textLeft, timeTop, textRight, timeH, timeBaseFmt, timeWeight, pal.textPrimary);
 
             if (!g->fullscreen) {
