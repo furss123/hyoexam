@@ -1465,12 +1465,14 @@ void drawFrame(HWND hwnd) {
             }
 
             // Two-tier card: an accent header pill ("1교시 (08:40~10:00)") above
-            // a larger content box ("국어(80분)") below it, separated by a fixed
-            // 3mm gap (previously the header overlapped the content, tab-style;
-            // now they're two distinct boxes with a small, exact gap).
-            float headerH = std::clamp((rowH - rowGapPx) * 0.30f, 22.0f, 110.0f);
+            // a content box ("국어(80분)") below it, separated by a fixed 3mm
+            // gap. Header and content each get exactly half the available
+            // height (5:5) and, since they share the same height and the same
+            // sizing ratio below, end up with the same font size too.
             float headerContentGap = 3.0f * kDipPerMm;
-            D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + headerH);
+            float availH = rowH - rowGapPx;
+            float boxH = (availH - headerContentGap) / 2.0f;
+            D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + boxH);
             D2D1_RECT_F content = D2D1::RectF(row.left, header.bottom + headerContentGap, row.right, row.bottom);
             float radius = g->fullscreen ? 14.0f : 10.0f;
 
@@ -1485,9 +1487,9 @@ void drawFrame(HWND hwnd) {
             D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
             D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
-            // Header (교시+시간) text is 1.3x its previous size, per request.
-            float headerFontSize = std::clamp(headerH * 0.44f, 12.0f, 56.0f) * 1.3f;
-            float contentFontSize = std::clamp((contentBox.bottom - contentBox.top) * 0.40f, 14.0f, 110.0f);
+            // Same ratio for both, applied to the same box height -> same font size.
+            float headerFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f);
+            float contentFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f);
 
             drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
                 headerBox, headerFontSize, DWRITE_FONT_WEIGHT_BOLD, hex(0xFFFFFF));
