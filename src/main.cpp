@@ -33,7 +33,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.5";
+constexpr wchar_t kAppVersion[] = L"1.0.6";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
@@ -469,42 +469,33 @@ IDWriteTextLayout* makeFittedLayout(const std::wstring& s, float baseSize,
     return layout;
 }
 
-// Draws the 교시/과목 title above the 시간 time line in the column [x..right],
-// each shrunk to fit the width on one line, positioned so the *visible* gap
-// between the title's baseline and the time's cap-top is exactly `inkGap` DIP
-// (not the font's ascent/descent whitespace). The two-line block's ink is
-// vertically centered on centerY. Uses each line's real DirectWrite baseline
-// metric, so the gap is correct regardless of font size or weight.
-void drawPeriodTextBlock(const std::wstring& title, const std::wstring& time,
-                         float x, float right, float centerY,
-                         float titleSize, DWRITE_FONT_WEIGHT titleW, D2D1_COLOR_F titleColor,
-                         float timeSize, DWRITE_FONT_WEIGHT timeW, D2D1_COLOR_F timeColor,
-                         float inkGap) {
-    float maxW = right - x;
-    float ts = titleSize, ms = timeSize;
-    IDWriteTextLayout* tl = makeFittedLayout(title, titleSize, titleW, maxW, ts);
-    IDWriteTextLayout* ml = makeFittedLayout(time, timeSize, timeW, maxW, ms);
-    if (!tl || !ml) { if (tl) tl->Release(); if (ml) ml->Release(); return; }
+// Width (DIP) of `s` set in `fmt`, for sizing badges/pills to their own text.
+float measureTextWidth(const std::wstring& s, IDWriteTextFormat* fmt) {
+    if (s.empty()) return 0.0f;
+    IDWriteTextLayout* layout = nullptr;
+    float w = 0.0f;
+    if (SUCCEEDED(g->dwriteFactory->CreateTextLayout(s.c_str(), (UINT32)s.size(), fmt, 1e6f, 1e6f, &layout)) && layout) {
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        w = m.width;
+        layout->Release();
+    }
+    return w;
+}
 
-    DWRITE_LINE_METRICS tlm{}, mlm{}; UINT32 cnt = 0;
-    tl->GetLineMetrics(&tlm, 1, &cnt);
-    ml->GetLineMetrics(&mlm, 1, &cnt);
-    const float kCap = 0.72f; // digit/Hangul cap height as a fraction of em (approx)
-
-    // Origins (line-tops) with title at ty=0, time below it so the time's ink
-    // top sits inkGap under the title's baseline.
-    float ty = 0.0f;
-    float titleBaseline = ty + tlm.baseline;            // title ink bottom ≈ baseline
-    float my = titleBaseline + inkGap - (mlm.baseline - kCap * ms); // time ink top = its baseline − cap
-    // Center the block's ink extent (title cap-top … time baseline) on centerY.
-    float inkTop = ty + tlm.baseline - kCap * ts;
-    float inkBottom = my + mlm.baseline;
-    float offset = centerY - (inkTop + inkBottom) * 0.5f;
-
-    g->renderTarget->DrawTextLayout(D2D1::Point2F(x, ty + offset), tl, brush(titleColor));
-    g->renderTarget->DrawTextLayout(D2D1::Point2F(x, my + offset), ml, brush(timeColor));
-    tl->Release();
-    ml->Release();
+// Draws `s` centered in `box`, shrinking from `baseSize` only as far as needed
+// to fit the box width on one line (never wraps, never grows past baseSize).
+void drawFittedCenteredText(const std::wstring& s, D2D1_RECT_F box, float baseSize,
+                            DWRITE_FONT_WEIGHT weight, D2D1_COLOR_F color) {
+    float maxW = (box.right - box.left) * 0.94f; // small side margin so glyphs don't touch the box edge
+    float size;
+    IDWriteTextLayout* layout = makeFittedLayout(s, baseSize, weight, maxW, size);
+    if (!layout) return;
+    layout->Release();
+    IDWriteTextFormat* fmt = makeFormat(kUiFontFamily, size, weight);
+    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    text(s, box, fmt, color, DWRITE_TEXT_ALIGNMENT_CENTER);
+    fmt->Release();
 }
 
 std::wstring formatClock(const SYSTEMTIME& st) {
@@ -1280,22 +1271,27 @@ void drawFrame(HWND hwnd) {
             fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
-    // Date/weekday on top, big clock below it — the whole block is centered as
-    // a unit within the card (both vertically and horizontally) using the
-    // actual chosen font sizes, so fullscreen's much larger clock digits stay
-    // visually balanced instead of sitting at windowed-mode offsets.
+    // Big clock alone, centered in the card -- the date moves to a small accent
+    // badge that straddles the card's top border (name-tag layout, per the
+    // reference design), instead of sitting as its own line above the clock.
     float clockCenterY = clockCard.top + (clockCard.bottom - clockCard.top) / 2.0f;
-    float dateLineH = fDate->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
-    // Coefficient tuned so the gap ends up half of what it was before the date
-    // font itself was made 2.5x bigger (0.6 * 0.5 / 2.5 = 0.12).
-    float blockGap = fDate->GetFontSize() * 0.12f;
-    float blockTotalH = dateLineH + blockGap + clockLineH;
-    float blockTop = clockCenterY - blockTotalH / 2.0f;
-    text(formatDate(st), D2D1::RectF(clockCard.left, blockTop, clockCard.right, blockTop + dateLineH),
-        fDate, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(formatClock(st), D2D1::RectF(clockCard.left, blockTop + dateLineH + blockGap, clockCard.right, blockTop + blockTotalH),
+    text(formatClock(st), D2D1::RectF(clockCard.left, clockCenterY - clockLineH / 2.0f, clockCard.right, clockCenterY + clockLineH / 2.0f),
         fClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // Date badge: accent pill overlapping the clock card's top edge.
+    {
+        float dateFontSize = std::clamp(fClock->GetFontSize() * 0.135f, 15.0f, 42.0f);
+        IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, dateFontSize, DWRITE_FONT_WEIGHT_BOLD);
+        std::wstring dateStr = formatDate(st);
+        float textW = measureTextWidth(dateStr, dateFmt);
+        float padX = dateFontSize * 0.7f, badgeH = dateFontSize * 1.85f;
+        D2D1_RECT_F badge = D2D1::RectF(clockCard.left + cardPad, clockCard.top - badgeH / 2.0f,
+            clockCard.left + cardPad + textW + padX * 2.0f, clockCard.top + badgeH / 2.0f);
+        roundedRect(badge, badgeH / 2.0f, hex(kHyoBlue));
+        text(dateStr, badge, dateFmt, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
+        dateFmt->Release();
+    }
 
     // ---- Memo card (free-write area under the clock) ----
     if (showMemo) {
@@ -1418,39 +1414,9 @@ void drawFrame(HWND hwnd) {
         g->periodListTop = ry;
         g->periodRowHeight = rowH;
 
-        // Per-row text base sizes. Fullscreen scales off the actual row height so
-        // a handful of periods read as big filled cards; windowed uses fixed
-        // sizes. The 과목/교시 title is 5pt smaller and the 시간 line 10pt larger
-        // than before (per request). These are the *base* (largest) sizes — each
-        // line then shrinks from here only as far as needed to fit its width, via
-        // drawFittedLine, so long subject/time text never wraps or reflows the row.
-        DWRITE_FONT_WEIGHT titleWeight = g->fullscreen ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_MEDIUM;
-        DWRITE_FONT_WEIGHT timeWeight = DWRITE_FONT_WEIGHT_BOLD; // 시간 줄은 굵게
-        float titleBaseSize, timeBaseSize;
-        if (g->fullscreen) {
-            titleBaseSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f) - 5.0f - 10.0f;
-            timeBaseSize = (std::clamp(rowH * 0.30f, 18.0f, 110.0f) + 10.0f) * 1.3f;
-        } else {
-            titleBaseSize = 15.0f - 10.0f; // 과목/교시: windowed 20pt − 5pt, further −10pt
-            timeBaseSize = 35.0f * 1.3f;   // 시간: 기존 35pt의 1.3배
-        }
-        // Floor so the further −10pt request can't shrink the title past
-        // legibility (raw 15−10=5pt windowed was basically invisible).
-        titleBaseSize = std::max(titleBaseSize, 10.0f);
         // Small fixed gap between period rows — a little breathing room without
         // eating into the now-uncapped fullscreen row height.
         float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
-        // Ink gap between the 교시 baseline and the 시간 cap-top: was 1mm, +5mm per request.
-        float periodInkGap = (1.0f + 5.0f) * kDipPerMm;
-        // Keep the pair inside the row: shrink both sizes uniformly if their
-        // (conservative, full-em) stacked height would exceed the row height.
-        float availBlockH = rowH - rowGapPx;
-        float emBlockH = titleBaseSize + timeBaseSize + periodInkGap;
-        if (emBlockH > availBlockH && emBlockH > 0.0f) {
-            float s = std::max(0.05f, availBlockH / emBlockH);
-            titleBaseSize *= s;
-            timeBaseSize *= s;
-        }
 
         g->periodRowRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
         g->periodDeleteRects.assign(active->periods.size(), D2D1::RectF(0, 0, 0, 0));
@@ -1473,47 +1439,42 @@ void drawFrame(HWND hwnd) {
             D2D1_RECT_F row = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + rowH - rowGapPx);
 
             if (isBeingDragged) {
-                // Soft drop-shadow + bright outline for a "lifted card" feel while dragging.
+                // Soft drop-shadow for a "lifted card" feel while dragging.
                 D2D1_RECT_F shadow = D2D1::RectF(row.left + 2, row.top + 5, row.right + 2, row.bottom + 5);
                 roundedRect(shadow, 10, hex(0x000000, 0.30f));
-                roundedRect(row, 10, hex(kHyoBlue, 0.24f));
-                g->renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(row, 10, 10), brush(hex(kHyoBlue, 0.9f)), 2.0f);
-            } else if (isCurrent) {
-                roundedRect(row, 10, hex(kHyoBlue, 0.16f));
             } else if (isHovered) {
-                // Subtle "raised" hover cue: brighter fill + visible border, signals it's clickable.
-                roundedRect(row, 10, hex(kHyoBlue, 0.09f), &pal.cardBorder);
-            } else if (g->fullscreen) {
-                // Fullscreen has no hover/current-only affordance to fall back on, and
-                // rows are now large (uncapped rowH) — an outlined card per period makes
-                // that filled space read as one deliberate block instead of stray text
-                // floating in empty background.
-                roundedRect(row, 10, hex(kHyoBlue, 0.05f), &pal.cardBorder);
+                // Subtle "raised" hover cue behind the card, signals it's clickable.
+                roundedRect(row, 12, hex(kHyoBlue, 0.09f), &pal.cardBorder);
             }
 
-            // Fullscreen rows are much wider/taller than windowed ones, so a flat
-            // 14px left inset (tuned for the compact windowed list) reads as
-            // cramped against the card edge -- scale it up for fullscreen.
-            float textLeft = row.left + (g->fullscreen ? 40.0f : 14.0f);
-            // Windowed text runs nearly the full row width (stopping just short of
-            // the delete-X), so the enlarged 시간 line has room to render big and
-            // only shrinks (adaptively) for unusually long text.
-            float textRight = g->fullscreen ? row.right - 40.0f : row.right - 52.0f;
+            // Two-tier card, per the reference layout: an accent header pill
+            // ("1교시 (08:40~10:00)") overlapping the top of a larger content box
+            // ("국어(80분)") below it -- the header is drawn last so it visually
+            // sits in front of the content box's top corners, tab-style.
+            float headerH = std::clamp((rowH - rowGapPx) * 0.30f, 22.0f, 110.0f);
+            float overlap = headerH * 0.22f;
+            D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + headerH);
+            D2D1_RECT_F content = D2D1::RectF(row.left, row.top + headerH - overlap, row.right, row.bottom);
+            float radius = g->fullscreen ? 14.0f : 10.0f;
 
-            // The title+time pair is centered as one block on the row's vertical
-            // center (교시·시간 여백 일치), sharing one left/right edge, with a
-            // precise 1mm ink gap between them (see drawPeriodTextBlock). Colors
-            // swapped from the original: time carries the stronger primary color,
-            // the label/subject the softer secondary one. The time line drops the
-            // spaces around "~" for a tighter "09:00~09:50".
-            float centerY = row.top + (rowH - rowGapPx) * 0.5f;
-            drawPeriodTextBlock(
-                p.label + L" " + p.subject,
-                p.start.format() + L"~" + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                textLeft, textRight, centerY,
-                titleBaseSize, titleWeight, isCurrent ? hex(kHyoBlue) : pal.textSecondary,
-                timeBaseSize, timeWeight, pal.textPrimary,
-                periodInkGap);
+            D2D1_COLOR_F contentFill = isCurrent ? hex(kHyoBlue, 0.14f) : pal.surface;
+            D2D1_COLOR_F contentBorder = isCurrent ? hex(kHyoBlue, 0.55f) : pal.cardBorder;
+            roundedRect(content, radius, contentFill, &contentBorder);
+
+            D2D1_COLOR_F headerFill = isBeingDragged ? hex(kHyoBlue, 0.9f) : isCurrent ? hex(kHyoBlue) : hex(kHyoBlueDark);
+            roundedRect(header, radius, headerFill);
+
+            float insetX = g->fullscreen ? 20.0f : 10.0f;
+            D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
+            D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top + overlap, content.right - insetX, content.bottom);
+
+            float headerFontSize = std::clamp(headerH * 0.44f, 12.0f, 56.0f);
+            float contentFontSize = std::clamp((contentBox.bottom - contentBox.top) * 0.40f, 14.0f, 110.0f);
+
+            drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
+                headerBox, headerFontSize, DWRITE_FONT_WEIGHT_BOLD, hex(0xFFFFFF));
+            drawFittedCenteredText(p.subject + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
+                contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
