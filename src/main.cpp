@@ -33,7 +33,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.4";
+constexpr wchar_t kAppVersion[] = L"1.0.5";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
@@ -1428,17 +1428,20 @@ void drawFrame(HWND hwnd) {
         DWRITE_FONT_WEIGHT timeWeight = DWRITE_FONT_WEIGHT_BOLD; // 시간 줄은 굵게
         float titleBaseSize, timeBaseSize;
         if (g->fullscreen) {
-            titleBaseSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f) - 5.0f;
+            titleBaseSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f) - 5.0f - 10.0f;
             timeBaseSize = (std::clamp(rowH * 0.30f, 18.0f, 110.0f) + 10.0f) * 1.3f;
         } else {
-            titleBaseSize = 15.0f;        // 과목/교시: windowed 20pt − 5pt
-            timeBaseSize = 35.0f * 1.3f;  // 시간: 기존 35pt의 1.3배
+            titleBaseSize = 15.0f - 10.0f; // 과목/교시: windowed 20pt − 5pt, further −10pt
+            timeBaseSize = 35.0f * 1.3f;   // 시간: 기존 35pt의 1.3배
         }
+        // Floor so the further −10pt request can't shrink the title past
+        // legibility (raw 15−10=5pt windowed was basically invisible).
+        titleBaseSize = std::max(titleBaseSize, 10.0f);
         // Small fixed gap between period rows — a little breathing room without
         // eating into the now-uncapped fullscreen row height.
         float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
-        // Target ink gap between the 교시 baseline and the 시간 cap-top: 1mm.
-        float periodInkGap = 1.0f * kDipPerMm;
+        // Ink gap between the 교시 baseline and the 시간 cap-top: was 1mm, +5mm per request.
+        float periodInkGap = (1.0f + 5.0f) * kDipPerMm;
         // Keep the pair inside the row: shrink both sizes uniformly if their
         // (conservative, full-em) stacked height would exceed the row height.
         float availBlockH = rowH - rowGapPx;
