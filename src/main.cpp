@@ -8,6 +8,7 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <uxtheme.h> // SetWindowTheme — dark-mode re-skin for native Edit/ComboBox controls
+#include <imm.h>    // ImmGetContext/ImmGetCompositionString — detect an in-progress Hangul (or other IME) composition
 #define _RICHEDIT_VER 0x0500 // CHARFORMAT2W / RICHEDIT50W (Msftedit.dll)
 #include <richedit.h>
 #include <string>
@@ -18,6 +19,9 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include "schedule.h"
 #include "settings.h"
@@ -28,6 +32,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "imm32.lib")
 
 using namespace hyo;
 
@@ -1046,6 +1051,24 @@ LRESULT CALLBACK RichMemoSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return CallWindowProcW(g->richMemoDefaultProc, hwnd, msg, wParam, lParam);
 }
 
+// True while `hwnd` has an in-progress IME composition (e.g. mid-way through
+// typing a Hangul syllable, before the jamo have combined and committed).
+// Streaming the RichEdit's content out (EM_STREAMOUT, used by the periodic
+// memo autosave) while a composition is open was finalizing/splitting the
+// not-yet-committed jamo instead of letting the IME combine them -- the first
+// syllable typed would compose fine (it usually finishes within one 250ms
+// tick), but every syllable after it came out as separate broken jamo,
+// because the autosave landed mid-composition and knocked the IME out of its
+// composition state. Skipping the save while composing (retried next tick)
+// avoids that entirely.
+bool hasActiveImeComposition(HWND hwnd) {
+    HIMC himc = ImmGetContext(hwnd);
+    if (!himc) return false;
+    LONG len = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
+    ImmReleaseContext(hwnd, himc);
+    return len > 0;
+}
+
 bool ptInRect(POINT pt, D2D1_RECT_F r); // defined below; used by the hover-tooltip pass in drawFrame
 
 // ---- Main frame ----
@@ -1271,27 +1294,24 @@ void drawFrame(HWND hwnd) {
             fSmall, g->timeSync.isSynced() ? hex(kTeal) : hex(kOrange), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
-    // Big clock alone, centered in the card -- the date moves to a small accent
-    // badge that straddles the card's top border (name-tag layout, per the
-    // reference design), instead of sitting as its own line above the clock.
+    // Date/weekday on top, big clock below it -- restored to the original
+    // placement (centered line above the clock; the overlapping name-tag
+    // badge tried earlier is reverted per request). The date's own font is
+    // 1.3x its normal size (좌측 상단 영역, i.e. this clock-card area).
     float clockCenterY = clockCard.top + (clockCard.bottom - clockCard.top) / 2.0f;
+    IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, fDate->GetFontSize() * 1.3f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    float dateLineH = dateFmt->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
-    text(formatClock(st), D2D1::RectF(clockCard.left, clockCenterY - clockLineH / 2.0f, clockCard.right, clockCenterY + clockLineH / 2.0f),
+    // Coefficient tuned so the gap ends up half of what it was before the date
+    // font itself was made 2.5x bigger (0.6 * 0.5 / 2.5 = 0.12).
+    float blockGap = dateFmt->GetFontSize() * 0.12f;
+    float blockTotalH = dateLineH + blockGap + clockLineH;
+    float blockTop = clockCenterY - blockTotalH / 2.0f;
+    text(formatDate(st), D2D1::RectF(clockCard.left, blockTop, clockCard.right, blockTop + dateLineH),
+        dateFmt, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(formatClock(st), D2D1::RectF(clockCard.left, blockTop + dateLineH + blockGap, clockCard.right, blockTop + blockTotalH),
         fClock, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    // Date badge: accent pill overlapping the clock card's top edge.
-    {
-        float dateFontSize = std::clamp(fClock->GetFontSize() * 0.135f, 15.0f, 42.0f);
-        IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, dateFontSize, DWRITE_FONT_WEIGHT_BOLD);
-        std::wstring dateStr = formatDate(st);
-        float textW = measureTextWidth(dateStr, dateFmt);
-        float padX = dateFontSize * 0.7f, badgeH = dateFontSize * 1.85f;
-        D2D1_RECT_F badge = D2D1::RectF(clockCard.left + cardPad, clockCard.top - badgeH / 2.0f,
-            clockCard.left + cardPad + textW + padX * 2.0f, clockCard.top + badgeH / 2.0f);
-        roundedRect(badge, badgeH / 2.0f, hex(kHyoBlue));
-        text(dateStr, badge, dateFmt, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
-        dateFmt->Release();
-    }
+    dateFmt->Release();
 
     // ---- Memo card (free-write area under the clock) ----
     if (showMemo) {
@@ -1933,7 +1953,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Flush memo edits to disk at most once per tick instead of on every
         // keystroke. EM_GETMODIFY is RichEdit's own built-in dirty flag --
         // more reliable than trying to catch every EN_CHANGE via WM_COMMAND.
-        if (g->hRichMemo && SendMessageW(g->hRichMemo, EM_GETMODIFY, 0, 0)) {
+        // Skipped mid-IME-composition (see hasActiveImeComposition) -- retried
+        // automatically on the next tick once the syllable commits.
+        if (g->hRichMemo && SendMessageW(g->hRichMemo, EM_GETMODIFY, 0, 0) && !hasActiveImeComposition(g->hRichMemo)) {
             saveMemoRtf();
         }
         return 0;
@@ -2197,6 +2219,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// Shared race state for raceTimeSources(), heap-allocated (via shared_ptr) so
+// the detached probe threads can safely outlive the function call that
+// started them -- only the last thread to finish actually frees it.
+struct TimeRaceState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int winner = -1;
+    int completed = 0;
+};
+
+// Probes every configured time source concurrently and returns the index of
+// whichever answers first (successfully), instead of committing up-front to
+// one (possibly slow or unreachable) fixed source. Returns as soon as a
+// winner is found (or all have failed) -- the still-racing losers are
+// detached and finish on their own, bounded by their own socket timeout.
+int raceTimeSources() {
+    auto state = std::make_shared<TimeRaceState>();
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kTimeSourceCount; i++) {
+        threads.emplace_back([i, state]() {
+            long long offset = 0;
+            bool ok = TimeSync::fetchSntpOffset(kTimeSources[i].host, offset);
+            std::lock_guard<std::mutex> lock(state->mtx);
+            if (ok && state->winner == -1) state->winner = i;
+            state->completed++;
+            state->cv.notify_all();
+        });
+    }
+    int winner;
+    {
+        std::unique_lock<std::mutex> lock(state->mtx);
+        state->cv.wait(lock, [&] { return state->winner != -1 || state->completed == kTimeSourceCount; });
+        winner = state->winner;
+    }
+    for (auto& t : threads) t.detach();
+    return winner;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
@@ -2210,6 +2270,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     loadProfilesFromDisk();
 
     if (g->settings.timeSourceIndex < 0 || g->settings.timeSourceIndex >= kTimeSourceCount) g->settings.timeSourceIndex = 0;
+    // Race all 3 time sources concurrently and adopt whichever answers first,
+    // instead of committing to a single (possibly slow/unreachable) fixed
+    // source -- redone on every launch since network conditions change.
+    int fastest = raceTimeSources();
+    if (fastest >= 0 && fastest != g->settings.timeSourceIndex) {
+        g->settings.timeSourceIndex = fastest;
+        g->settings.save();
+    }
     g->timeSync.setHost(kTimeSources[g->settings.timeSourceIndex].host);
     g->timeSync.start();
 

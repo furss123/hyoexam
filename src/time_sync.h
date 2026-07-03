@@ -38,9 +38,14 @@ public:
     bool isSynced() const { return synced_.load(std::memory_order_relaxed); }
     long long offsetMillis() const { return offsetMs_.load(std::memory_order_relaxed); }
 
+    // One-shot SNTP probe against an arbitrary host, independent of any
+    // TimeSync instance's state. Public/static so the app can race several
+    // candidate hosts at startup (see raceTimeSources() in main.cpp) and adopt
+    // whichever answers first, before committing to a single TimeSync instance.
+    static bool fetchSntpOffset(const std::wstring& host, long long& outOffsetMs);
+
 private:
     void run();
-    bool fetchSntpOffset(const std::wstring& host, long long& outOffsetMs);
     std::wstring currentHost();
 
     std::thread worker_;
