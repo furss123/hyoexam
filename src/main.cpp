@@ -1299,9 +1299,8 @@ void drawFrame(HWND hwnd) {
     IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, fDate->GetFontSize() * 1.3f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     float dateLineH = dateFmt->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
-    // Coefficient tuned so the gap ends up half of what it was before the date
-    // font itself was made 2.5x bigger (0.6 * 0.5 / 2.5 = 0.12).
-    float blockGap = dateFmt->GetFontSize() * 0.12f;
+    // Halved again per request (was 0.12).
+    float blockGap = dateFmt->GetFontSize() * 0.06f;
     float blockTotalH = dateLineH + blockGap + clockLineH;
     float blockTop = clockCenterY - blockTotalH / 2.0f;
     text(formatDate(st), D2D1::RectF(clockCard.left, blockTop, clockCard.right, blockTop + dateLineH),
