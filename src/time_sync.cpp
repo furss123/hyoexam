@@ -33,6 +33,11 @@ void TimeSync::setHost(const std::wstring& host) {
     }
 }
 
+void TimeSync::refresh() {
+    synced_.store(false, std::memory_order_relaxed);
+    forceFetch_.store(true, std::memory_order_relaxed);
+}
+
 std::wstring TimeSync::currentHost() {
     std::lock_guard<std::mutex> lock(hostMutex_);
     return host_;
@@ -64,8 +69,11 @@ void TimeSync::run() {
             offsetMs_.store(offset, std::memory_order_relaxed);
             synced_.store(true, std::memory_order_relaxed);
         }
-        // Sleep in short slices so stop() reacts quickly instead of blocking ~10s.
+        // Sleep in short slices so stop()/refresh() react quickly instead of
+        // blocking the full interval. A pending refresh() breaks out early for
+        // an immediate re-fetch.
         for (int i = 0; i < 100 && running_.load(std::memory_order_relaxed); i++) {
+            if (forceFetch_.exchange(false, std::memory_order_relaxed)) break;
             std::this_thread::sleep_for(kSyncInterval / 100);
         }
     }

@@ -27,6 +27,11 @@ public:
     // (within ~3s) and immediately marks the offset as unsynced.
     void setHost(const std::wstring& host);
 
+    // Forces an immediate re-sync of the current host (the toolbar refresh
+    // button): marks unsynced and wakes the worker to fetch right away instead
+    // of waiting out the remaining slice of the 3s interval.
+    void refresh();
+
     // Current wall-clock time = system time + last-known offset to the server.
     std::chrono::system_clock::time_point now() const;
 
@@ -41,6 +46,7 @@ private:
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::atomic<bool> synced_{false};
+    std::atomic<bool> forceFetch_{false}; // set by refresh(); breaks the worker's sleep for an immediate fetch
     std::atomic<long long> offsetMs_{0};
 
     mutable std::mutex hostMutex_;

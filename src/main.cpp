@@ -148,7 +148,6 @@ struct AppState {
     IDWriteTextFormat* fmtVersion = nullptr;
     IDWriteTextFormat* fmtIcon = nullptr;      // inline glyphs (footer link arrow, dropdown chevron)
     IDWriteTextFormat* fmtIconBox = nullptr;   // larger glyphs inside boxed icon buttons (save/load/theme/fullscreen/delete)
-    IDWriteTextFormat* fmtPeriodTimeWin = nullptr; // windowed period-row time text — fmtSmall + 10pt, kept separate so it doesn't resize fmtSmall everywhere else
 
     // Fullscreen (TV/projector) variants of clock/date/body/small — sized off the
     // actual monitor resolution so the student-facing display fills the frame
@@ -166,15 +165,6 @@ struct AppState {
     // up width, instead of only ever being able to shrink further.
     float fsClockBaseSize = -1.0f;
 
-    // Fullscreen period-row title/time text is sized off the actual row height
-    // (not a fixed windowed size), so a handful of periods fill their large
-    // rows and many periods still fit legibly — same idea as fmtClockFS.
-    IDWriteTextFormat* fmtPeriodTitleFS = nullptr;
-    IDWriteTextFormat* fmtPeriodTimeFS = nullptr;
-    float fsPeriodBuiltForRowH = -1.0f;
-    float fsPeriodTimeCorrectedForWidth = -1.0f; // re-check against the actual row width, like fsClockCorrectedForWidth
-    float fsPeriodTimeBaseSize = -1.0f; // height-only baseline, same grow-back purpose as fsClockBaseSize
-
     Settings settings;
     ScheduleStore scheduleStore;
     TimeSync timeSync;
@@ -186,6 +176,14 @@ struct AppState {
     // Hit-test rects for the admin toolbar, recomputed each frame it's drawn.
     D2D1_RECT_F rectFullscreenBtn{};
     D2D1_RECT_F rectThemeToggle{};
+    D2D1_RECT_F rectRefreshBtn{}; // manual time re-sync, right of the time-source dropdown
+
+    // Hover tooltips for the glyph-only toolbar/memo icons. Rebuilt each frame
+    // as icons are drawn (windowed only); the label under lastMousePt is drawn
+    // last, on top. hoveredTooltip is tracked only to trigger a repaint on change.
+    POINT lastMousePt{ -1, -1 };
+    std::vector<std::pair<D2D1_RECT_F, std::wstring>> tooltipRegions;
+    int hoveredTooltip = -1;
     // Fullscreen-only: the return-to-window icon stays hidden until the mouse
     // moves, then fades back out after 5s idle. 0 = hidden (not moved yet since
     // entering fullscreen).
@@ -338,7 +336,6 @@ void buildFonts() {
     if (g->fmtBody) g->fmtBody->Release();
     if (g->fmtSmall) g->fmtSmall->Release();
     if (g->fmtSmallBold) g->fmtSmallBold->Release();
-    if (g->fmtPeriodTimeWin) g->fmtPeriodTimeWin->Release();
 
     const wchar_t* family = kUiFontFamily;
     g->fmtClock = makeFormat(family, 150.0f, DWRITE_FONT_WEIGHT_BOLD);
@@ -347,8 +344,6 @@ void buildFonts() {
     g->fmtBody = makeFormat(family, 20.0f, DWRITE_FONT_WEIGHT_MEDIUM);
     g->fmtSmall = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_NORMAL);
     g->fmtSmallBold = makeFormat(family, 15.0f, DWRITE_FONT_WEIGHT_BOLD); // memo toolbar's "가" (Bold) icon
-    g->fmtPeriodTimeWin = makeFormat(family, 25.0f, DWRITE_FONT_WEIGHT_NORMAL); // windowed period-row time text: fmtSmall (15pt) + 10pt
-    g->fmtPeriodTimeWin->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     g->fmtClock->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     // Headings are single-line titles — clip rather than wrap-and-overlap the row below
     // when the window gets narrow (e.g. windowed edit mode at a small size).
@@ -386,27 +381,6 @@ void buildFullscreenFonts(float height) {
     g->fsFontsBuiltForHeight = height;
     g->fsClockBaseSize = clockSize;
     g->fsClockCorrectedForWidth = -1.0f; // force the width-fit re-check in drawFrame against the fresh clock format
-}
-
-// Fullscreen period-row title/time text, sized off the actual row height so a
-// handful of periods (large rows) fill them instead of leaving a fixed small
-// font floating in a mostly-empty box, while many periods (small rows) still
-// shrink to fit legibly. Rebuilt only when rowH actually changes.
-void buildPeriodRowFonts(float rowH) {
-    if (g->fmtPeriodTitleFS) g->fmtPeriodTitleFS->Release();
-    if (g->fmtPeriodTimeFS) g->fmtPeriodTimeFS->Release();
-    float titleSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f);
-    // Height-only guess, tuned bigger than before -- the actual applied size is
-    // re-checked against the real row width in drawFrame (fsPeriodTimeCorrectedForWidth)
-    // and shrunk if it would wrap the "HH:MM ~ HH:MM(NN분)" line to two lines.
-    float timeSize = std::clamp(rowH * 0.30f, 18.0f, 110.0f);
-    // Bold title reads better at a glance from across a classroom.
-    g->fmtPeriodTitleFS = makeFormat(kUiFontFamily, titleSize, DWRITE_FONT_WEIGHT_BOLD);
-    g->fmtPeriodTimeFS = makeFormat(kUiFontFamily, timeSize, DWRITE_FONT_WEIGHT_MEDIUM);
-    g->fmtPeriodTimeFS->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-    g->fsPeriodBuiltForRowH = rowH;
-    g->fsPeriodTimeBaseSize = timeSize;
-    g->fsPeriodTimeCorrectedForWidth = -1.0f; // force the width-fit re-check against the fresh format
 }
 
 void createDeviceIndependentResources() {
@@ -463,6 +437,38 @@ void text(const std::wstring& s, D2D1_RECT_F r, IDWriteTextFormat* fmt, D2D1_COL
           DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
     fmt->SetTextAlignment(align);
     g->renderTarget->DrawText(s.c_str(), (UINT32)s.size(), fmt, r, brush(color));
+}
+
+// Draws `s` on a single non-wrapping line inside the fixed box [x,top]..[right,top+boxH],
+// shrinking the font from baseFmt's size only as much as needed to fit the width
+// (never grows past it). The box height stays constant regardless of the fitted
+// size, so neighboring lines never reflow — this is what keeps the period rows'
+// layout ("문단") stable as subject/time text gets longer. `weight` must match
+// baseFmt so the shrunk format renders in the same face.
+void drawFittedLine(const std::wstring& s, float x, float top, float right, float boxH,
+                    IDWriteTextFormat* baseFmt, DWRITE_FONT_WEIGHT weight, D2D1_COLOR_F color) {
+    float maxW = right - x;
+    float baseSize = baseFmt->GetFontSize();
+    float size = baseSize;
+    if (!s.empty() && maxW > 0) {
+        IDWriteTextLayout* layout = nullptr;
+        if (SUCCEEDED(g->dwriteFactory->CreateTextLayout(
+                s.c_str(), (UINT32)s.size(), baseFmt, 1e6f, 1e6f, &layout)) && layout) {
+            DWRITE_TEXT_METRICS m{};
+            layout->GetMetrics(&m);
+            layout->Release();
+            if (m.width > maxW && m.width > 0.0f) size = baseSize * (maxW / m.width);
+        }
+    }
+    D2D1_RECT_F box = D2D1::RectF(x, top, right, top + boxH);
+    if (size == baseSize) {
+        text(s, box, baseFmt, color);
+        return;
+    }
+    IDWriteTextFormat* fmt = makeFormat(kUiFontFamily, size, weight);
+    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    text(s, box, fmt, color);
+    fmt->Release();
 }
 
 std::wstring formatClock(const SYSTEMTIME& st) {
@@ -1013,6 +1019,8 @@ LRESULT CALLBACK RichMemoSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return CallWindowProcW(g->richMemoDefaultProc, hwnd, msg, wParam, lParam);
 }
 
+bool ptInRect(POINT pt, D2D1_RECT_F r); // defined below; used by the hover-tooltip pass in drawFrame
+
 // ---- Main frame ----
 void drawFrame(HWND hwnd) {
     createDeviceResources(hwnd);
@@ -1044,7 +1052,12 @@ void drawFrame(HWND hwnd) {
     int nowMinutes = st.wHour * 60 + st.wMinute;
 
     float pad = 48;    // horizontal margin (left/right) — unchanged
-    float padV = 24;   // vertical margin (top/bottom) — halved from the old 48 to cut the dead space above/below the cards
+    // Vertical (top/bottom) margin: windowed keeps the compact 24px; fullscreen
+    // gets a physical 20mm band top and bottom. A Direct2D DIP is 1/96", so
+    // 20mm = 20/25.4*96 ≈ 75.6 DIP, which the render target maps to 20mm as long
+    // as its DPI matches the monitor's (the default for an HwndRenderTarget).
+    constexpr float kDipPerMm = 96.0f / 25.4f;
+    float padV = g->fullscreen ? (20.0f * kDipPerMm) : 24.0f;
     float gap = 24;
     // Fullscreen is the clean student-facing display: no admin toolbar, no footer.
     float footerHeight = g->fullscreen ? 0.0f : 40.0f;
@@ -1065,6 +1078,11 @@ void drawFrame(HWND hwnd) {
         float iconsRight = size.width - pad;
         float iconTop = padV + (topBarHeight - iconSize) / 2.0f;
 
+        // Tooltip regions are rebuilt every frame as the icons are drawn; a small
+        // lambda both registers the hover label and keeps the call sites terse.
+        g->tooltipRegions.clear();
+        auto tip = [&](const D2D1_RECT_F& r, const wchar_t* label) { g->tooltipRegions.push_back({ r, label }); };
+
         // Right side: theme toggle immediately left of fullscreen.
         g->rectFullscreenBtn = D2D1::RectF(iconsRight - iconSize, iconTop, iconsRight, iconTop + iconSize);
         roundedRect(g->rectFullscreenBtn, 10, hex(kHyoBlue, 0.12f));
@@ -1082,6 +1100,11 @@ void drawFrame(HWND hwnd) {
         g->rectSaveIcon = D2D1::RectF(iconsRight - iconSize * 4 - iconGap * 3, iconTop, iconsRight - iconSize * 3 - iconGap * 3, iconTop + iconSize);
         roundedRect(g->rectSaveIcon, 10, hex(kHyoBlue, 0.12f));
         text(L"", g->rectSaveIcon, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        tip(g->rectFullscreenBtn, L"전체화면");
+        tip(g->rectThemeToggle, isEffectivelyLight() ? L"다크 모드" : L"라이트 모드");
+        tip(g->rectLoadIcon, L"불러오기");
+        tip(g->rectSaveIcon, L"저장하기");
 
         // Left side toolbar boxes, all one uniform width/gap: exam-type tabs
         // (모의고사 / 지필평가) → 화면구성 (구 "표시") → 시간 기준 선택, in that order.
@@ -1116,6 +1139,14 @@ void drawFrame(HWND hwnd) {
         text(L"", D2D1::RectF(g->rectTimeSourceButton.right - 26, g->rectTimeSourceButton.top,
                 g->rectTimeSourceButton.right - 4, g->rectTimeSourceButton.bottom),
             g->fmtIcon, pal.textSecondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+        bx += kToolboxW + iconGap;
+
+        // Refresh button: re-applies / re-syncs the selected time source right now
+        // instead of waiting out the 3s interval. Segoe MDL2 "Refresh" glyph.
+        g->rectRefreshBtn = D2D1::RectF(bx, iconTop, bx + iconSize, iconTop + iconSize);
+        roundedRect(g->rectRefreshBtn, 10, hex(kHyoBlue, 0.12f));
+        text(L"", g->rectRefreshBtn, g->fmtIconBox, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER);
+        tip(g->rectRefreshBtn, L"시간 새로고침");
     } else {
         // Fullscreen still exposes one unobtrusive "return to window" icon,
         // top-right corner, for mouse-only setups (no keyboard for Esc/F11).
@@ -1132,9 +1163,11 @@ void drawFrame(HWND hwnd) {
         g->rectLoadIcon = D2D1::RectF(0, 0, 0, 0);
         g->scheduleButtons.clear();
         g->rectTimeSourceButton = D2D1::RectF(0, 0, 0, 0);
+        g->rectRefreshBtn = D2D1::RectF(0, 0, 0, 0);
         g->timeSourceDropdownOpen = false;
         g->rectDisplaySettingsButton = D2D1::RectF(0, 0, 0, 0);
         g->displaySettingsOpen = false;
+        g->tooltipRegions.clear(); // no tooltips on the clean fullscreen display
     }
 
     // Left column: clock (+ memo below it). Right column: today's period
@@ -1285,6 +1318,20 @@ void drawFrame(HWND hwnd) {
               roundedRect(D2D1::RectF(r.left + 6, r.bottom - 7, r.right - 6, r.bottom - 4), 1, hex(0xFFD54A)); }
             { D2D1_RECT_F r = memoBtnBox(g->rectMemoEmoji, false);
               text(L"🙂", r, g->fmtBody, hex(kHyoBlue), DWRITE_TEXT_ALIGNMENT_CENTER); }
+
+            // Hover labels for the (glyph-only) memo formatting buttons. Pushed
+            // straight onto tooltipRegions, which the toolbar block cleared and
+            // populated earlier this same frame.
+            g->tooltipRegions.push_back({ g->rectMemoBold, L"굵게" });
+            g->tooltipRegions.push_back({ g->rectMemoUnderline, L"밑줄" });
+            g->tooltipRegions.push_back({ g->rectMemoAlignLeft, L"왼쪽 정렬" });
+            g->tooltipRegions.push_back({ g->rectMemoAlignCenter, L"가운데 정렬" });
+            g->tooltipRegions.push_back({ g->rectMemoAlignRight, L"오른쪽 정렬" });
+            g->tooltipRegions.push_back({ g->rectMemoSizeDown, L"글자 작게" });
+            g->tooltipRegions.push_back({ g->rectMemoSizeUp, L"글자 크게" });
+            g->tooltipRegions.push_back({ g->rectMemoFontColor, L"글자 색" });
+            g->tooltipRegions.push_back({ g->rectMemoBgColor, L"배경 색" });
+            g->tooltipRegions.push_back({ g->rectMemoEmoji, L"이모지" });
         } else {
             g->rectMemoBold = g->rectMemoUnderline = D2D1::RectF(0, 0, 0, 0);
             g->rectMemoAlignLeft = g->rectMemoAlignCenter = g->rectMemoAlignRight = D2D1::RectF(0, 0, 0, 0);
@@ -1335,13 +1382,26 @@ void drawFrame(HWND hwnd) {
         g->periodListTop = ry;
         g->periodRowHeight = rowH;
 
-        // Fullscreen sizes the period title/time text off the actual row height
-        // (rebuilt lazily when rowH changes) so a handful of periods — large
-        // rows — read as big, filled cards instead of small fixed-size text
-        // floating in a mostly-empty box; windowed mode keeps its fixed sizes.
-        if (g->fullscreen && g->fsPeriodBuiltForRowH != rowH) buildPeriodRowFonts(rowH);
-        IDWriteTextFormat* rowTitleFmt = g->fullscreen ? g->fmtPeriodTitleFS : fBody;
-        IDWriteTextFormat* rowTimeFmt = g->fullscreen ? g->fmtPeriodTimeFS : g->fmtPeriodTimeWin;
+        // Per-row text base sizes. Fullscreen scales off the actual row height so
+        // a handful of periods read as big filled cards; windowed uses fixed
+        // sizes. The 과목/교시 title is 5pt smaller and the 시간 line 10pt larger
+        // than before (per request). These are the *base* (largest) sizes — each
+        // line then shrinks from here only as far as needed to fit its width, via
+        // drawFittedLine, so long subject/time text never wraps or reflows the row.
+        DWRITE_FONT_WEIGHT titleWeight = g->fullscreen ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_MEDIUM;
+        DWRITE_FONT_WEIGHT timeWeight = g->fullscreen ? DWRITE_FONT_WEIGHT_MEDIUM : DWRITE_FONT_WEIGHT_NORMAL;
+        float titleBaseSize, timeBaseSize;
+        if (g->fullscreen) {
+            titleBaseSize = std::clamp(rowH * 0.32f, 26.0f, 130.0f) - 5.0f;
+            timeBaseSize = std::clamp(rowH * 0.30f, 18.0f, 110.0f) + 10.0f;
+        } else {
+            titleBaseSize = 15.0f; // 과목/교시: windowed 20pt − 5pt
+            timeBaseSize = 35.0f;  // 시간: windowed 25pt + 10pt
+        }
+        IDWriteTextFormat* titleBaseFmt = makeFormat(kUiFontFamily, titleBaseSize, titleWeight);
+        titleBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        IDWriteTextFormat* timeBaseFmt = makeFormat(kUiFontFamily, timeBaseSize, timeWeight);
+        timeBaseFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         // Small fixed gap between period rows — a little breathing room without
         // eating into the now-uncapped fullscreen row height.
         float rowGapPx = g->fullscreen ? 20.0f : 8.0f;
@@ -1389,52 +1449,19 @@ void drawFrame(HWND hwnd) {
             // 14px left inset (tuned for the compact windowed list) reads as
             // cramped against the card edge -- scale it up for fullscreen.
             float textLeft = row.left + (g->fullscreen ? 40.0f : 14.0f);
-            float textRight;
-            if (g->fullscreen) {
-                textRight = row.right - 32;
-            } else {
-                // Windowed 교시/시간 text is deliberately narrower than the row
-                // itself -- half of the old full-row width, left-aligned.
-                float fullTextRight = row.right - 46;
-                textRight = textLeft + (fullTextRight - textLeft) / 2.0f;
-            }
+            // Windowed text runs nearly the full row width (stopping just short of
+            // the delete-X), so the enlarged 시간 line has room to render big and
+            // only shrinks (adaptively) for unusually long text.
+            float textRight = g->fullscreen ? row.right - 40.0f : row.right - 52.0f;
 
-            // The height-only guess in buildPeriodRowFonts() can size the time
-            // line too wide for narrower cards (it doesn't know the row width
-            // yet); re-check against the real available width here and shrink
-            // if needed so "HH:MM ~ HH:MM(NN분)" never wraps to a second line,
-            // while leaving the little right margin textRight already reserves.
-            // Re-derived from fsPeriodTimeBaseSize (the height-only baseline),
-            // same grow-back reasoning as the clock's fsClockBaseSize above.
-            if (g->fullscreen) {
-                float availWidth = textRight - textLeft;
-                if (g->fsPeriodTimeCorrectedForWidth != availWidth) {
-                    const float kTimeCharCount = 19.0f;  // "00:00 ~ 00:00(999분)" worst case
-                    const float kTimeAdvanceEm = 0.56f;  // approx. advance width as a fraction of em
-                    float widthFitSize = availWidth / (kTimeCharCount * kTimeAdvanceEm);
-                    float appliedSize = std::min(g->fsPeriodTimeBaseSize, std::clamp(widthFitSize, 16.0f, 110.0f));
-                    if (appliedSize != rowTimeFmt->GetFontSize()) {
-                        rowTimeFmt->Release();
-                        rowTimeFmt = makeFormat(kUiFontFamily, appliedSize, DWRITE_FONT_WEIGHT_MEDIUM);
-                        rowTimeFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-                        g->fmtPeriodTimeFS = rowTimeFmt;
-                    }
-                    g->fsPeriodTimeCorrectedForWidth = availWidth;
-                }
-            }
-
-            // Title/time line positions scale off the actual chosen font sizes
-            // (rather than fixed 6/34/36/14px offsets) so fullscreen's larger
-            // rowTitleFmt/rowTimeFmt don't clip or crowd inside the also-larger rowH.
-            // In fullscreen the text block is centered within the (large,
-            // uncapped) row rather than pinned near the top, since the row IS
-            // the period's whole visual block now.
-            float titleH = rowTitleFmt->GetFontSize() * 1.3f;
-            float timeH = rowTimeFmt->GetFontSize() * 1.3f;
-            // Fixed 3pt gap between the 교시/과목 title and the time line, in both
-            // windowed and fullscreen (was font-size-proportional, which opened up
-            // to 20pt+ on the large fullscreen fonts).
-            float lineGap = 3.0f;
+            // Fixed line-box heights derived from the *base* sizes (not the fitted
+            // ones), so a line shrinking to fit its width never changes the row's
+            // vertical layout. In fullscreen the whole title+time block is centered
+            // in the row with equal top/bottom margin (교시·시간 여백 일치); the two
+            // lines share one left edge (textLeft) and one right edge (textRight).
+            float titleH = titleBaseSize * 1.3f;
+            float timeH = timeBaseSize * 1.3f;
+            float lineGap = 3.0f; // fixed 3pt gap between 교시/과목 title and time line
             float titleTop = g->fullscreen
                 ? row.top + (rowH - rowGapPx - (titleH + lineGap + timeH)) / 2.0f
                 : row.top + rowH * 0.10f;
@@ -1442,12 +1469,11 @@ void drawFrame(HWND hwnd) {
             // Time/subject colors swapped from the original design: the period
             // time now carries the stronger (primary) color and the label/subject
             // the softer (secondary) one -- matches how this schedule is actually
-            // scanned (time first).
-            text(p.label + L" " + p.subject, D2D1::RectF(textLeft, titleTop, textRight, titleTop + titleH),
-                rowTitleFmt, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
-            text(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                D2D1::RectF(textLeft, timeTop, textRight, timeTop + timeH),
-                rowTimeFmt, pal.textPrimary);
+            // scanned (time first). Each line auto-shrinks to fit textRight.
+            drawFittedLine(p.label + L" " + p.subject, textLeft, titleTop, textRight, titleH,
+                titleBaseFmt, titleWeight, isCurrent ? hex(kHyoBlue) : pal.textSecondary);
+            drawFittedLine(p.start.format() + L" ~ " + p.end.format() + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
+                textLeft, timeTop, textRight, timeH, timeBaseFmt, timeWeight, pal.textPrimary);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
@@ -1461,6 +1487,8 @@ void drawFrame(HWND hwnd) {
 
             ry += rowH;
         }
+        titleBaseFmt->Release();
+        timeBaseFmt->Release();
 
         if (!g->fullscreen) {
             g->rectAddPeriod = D2D1::RectF(rx, ry, rightCard.right - cardPad, ry + rowH - rowGapPx);
@@ -1543,6 +1571,30 @@ void drawFrame(HWND hwnd) {
     if (g->timeSourceDropdownOpen) drawTimeSourceDropdown();
     if (g->displaySettingsOpen) drawDisplaySettingsDropdown();
     if (g->memoEmojiPickerOpen) drawMemoEmojiPicker();
+
+    // Hover tooltip for the glyph-only icons (windowed, no modal). Drawn last so
+    // it sits above everything; a small dark bubble just below the icon (flipped
+    // above if it would fall off the bottom), horizontally clamped to the window.
+    if (!g->fullscreen && g->editingPeriodIndex == -1 && !g->savingProfile && !g->loadingProfile) {
+        for (auto& [r, label] : g->tooltipRegions) {
+            if (!ptInRect(g->lastMousePt, r)) continue;
+            float padX = 12.0f, h = 28.0f, w = 80.0f;
+            IDWriteTextLayout* layout = nullptr;
+            if (SUCCEEDED(g->dwriteFactory->CreateTextLayout(label.c_str(), (UINT32)label.size(),
+                    g->fmtSmall, 1e6f, 1e6f, &layout)) && layout) {
+                DWRITE_TEXT_METRICS m{}; layout->GetMetrics(&m); layout->Release();
+                w = m.width + padX * 2.0f;
+            }
+            float cx = (r.left + r.right) / 2.0f;
+            float tx = std::clamp(cx - w / 2.0f, 8.0f, size.width - w - 8.0f);
+            float ty = r.bottom + 6.0f;
+            if (ty + h > size.height) ty = r.top - 6.0f - h;
+            D2D1_RECT_F tipRect = D2D1::RectF(tx, ty, tx + w, ty + h);
+            roundedRect(tipRect, 6, hex(0x1F2937, 0.96f));
+            text(label, tipRect, g->fmtSmall, hex(0xFFFFFF), DWRITE_TEXT_ALIGNMENT_CENTER);
+            break;
+        }
+    }
 
     HRESULT hr = g->renderTarget->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) discardDeviceResources();
@@ -1952,10 +2004,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g->settings.timeSourceIndex = i;
                     g->settings.save();
                     g->timeSync.setHost(kTimeSources[i].host);
+                    g->timeSync.refresh(); // apply the picked source immediately
                     break;
                 }
             }
             g->timeSourceDropdownOpen = false;
+        } else if (ptInRect(pt, g->rectRefreshBtn)) {
+            g->timeSync.refresh(); // manual re-sync of the current source, now
+            g->toastText = L"시간 동기화 중…";
+            g->toastShownAtMs = GetTickCount64();
         } else if (ptInRect(pt, g->rectTimeSourceButton)) {
             g->timeSourceDropdownOpen = true;
         } else if (g->displaySettingsOpen) {
@@ -2032,6 +2089,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         POINT pt{ LOWORD(lParam), HIWORD(lParam) };
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
+        g->lastMousePt = pt;
+        // Icon hover tooltip: repaint when the hovered region changes so the
+        // bubble appears/updates/disappears. Uses last frame's regions (the
+        // toolbar doesn't move between frames).
+        {
+            int newTip = -1;
+            for (size_t i = 0; i < g->tooltipRegions.size(); i++) {
+                if (ptInRect(pt, g->tooltipRegions[i].first)) { newTip = (int)i; break; }
+            }
+            if (newTip != g->hoveredTooltip) {
+                g->hoveredTooltip = newTip;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
         if (g->fullscreen) {
             g->fullscreenIconLastMoveMs = GetTickCount64();
             if (g->cursorHiddenInFullscreen) {
