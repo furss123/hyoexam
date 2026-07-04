@@ -1425,7 +1425,11 @@ void drawFrame(HWND hwnd) {
         // on a projector read as large, evenly distributed cards instead of a small
         // packed list floating in empty space.
         size_t slotCount = active->periods.size() + (!g->fullscreen ? 1 : 0);
-        float rowCap = g->fullscreen ? 100000.0f : 84.0f;
+        // Raised from 84 -- the two-tier header/content card needs more room
+        // than the old single-line layout did, especially now that its font is
+        // 13pt bigger. Still just a cap: rows shrink below this automatically
+        // when there isn't room for every period at this height (see below).
+        float rowCap = g->fullscreen ? 100000.0f : 110.0f;
         float rowH = std::min(rowCap, (rightCard.bottom - 16 - ry) / (float)std::max<size_t>(1, slotCount));
         g->periodListTop = ry;
         g->periodRowHeight = rowH;
@@ -1475,25 +1479,41 @@ void drawFrame(HWND hwnd) {
             D2D1_RECT_F content = D2D1::RectF(row.left, header.bottom + headerContentGap, row.right, row.bottom);
             float radius = g->fullscreen ? 14.0f : 10.0f;
 
-            D2D1_COLOR_F contentFill = isCurrent ? hex(kHyoBlue, 0.14f) : pal.surface;
-            D2D1_COLOR_F contentBorder = isCurrent ? hex(kHyoBlue, 0.55f) : pal.cardBorder;
+            // Each period cycles through a distinct brand accent color (rather
+            // than every card sharing the same blue) so "1교시, 2교시, ..." read
+            // apart at a glance -- keyed to the period's own index (idx), not
+            // its on-screen slot, so a color doesn't jump around mid-drag.
+            constexpr UINT32 kPeriodPalette[] = { kHyoBlue, kPurple, kOrange, kTeal };
+            UINT32 periodColor = kPeriodPalette[idx % (int)(sizeof(kPeriodPalette) / sizeof(kPeriodPalette[0]))];
+
+            D2D1_COLOR_F contentFill = isCurrent ? hex(periodColor, 0.14f) : pal.surface;
+            D2D1_COLOR_F contentBorder = hex(periodColor, isCurrent ? 0.7f : 0.4f);
             roundedRect(content, radius, contentFill, &contentBorder);
 
-            D2D1_COLOR_F headerFill = isBeingDragged ? hex(kHyoBlue, 0.9f) : isCurrent ? hex(kHyoBlue) : hex(kHyoBlueDark);
+            D2D1_COLOR_F headerFill = isBeingDragged ? hex(kHyoBlue, 0.9f) : hex(periodColor, isCurrent ? 1.0f : 0.85f);
             roundedRect(header, radius, headerFill);
+
+            // The currently-running period still needs its own "this one, now"
+            // cue distinct from the identity coloring above -- a bright outline
+            // around the whole two-box card.
+            if (isCurrent && !isBeingDragged) {
+                D2D1_RECT_F full = D2D1::RectF(row.left, row.top, row.right, row.bottom);
+                g->renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(full, radius, radius), brush(hex(0xFFFFFF, 0.6f)), 2.0f);
+            }
 
             float insetX = g->fullscreen ? 20.0f : 10.0f;
             D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
             D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
-            // Same ratio for both, applied to the same box height -> same font size.
-            float headerFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f);
-            float contentFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f);
+            // Same ratio for both, applied to the same box height -> same font
+            // size, plus a flat +13pt on top of that (per request).
+            float headerFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f) + 13.0f;
+            float contentFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f) + 13.0f;
 
             drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
                 headerBox, headerFontSize, DWRITE_FONT_WEIGHT_BOLD, hex(0xFFFFFF));
             drawFittedCenteredText(p.subject + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
+                contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(periodColor) : pal.textPrimary);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
