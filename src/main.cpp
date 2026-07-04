@@ -140,6 +140,7 @@ struct AppState {
     IDWriteFactory* dwriteFactory = nullptr;
     ID2D1HwndRenderTarget* renderTarget = nullptr;
     ID2D1SolidColorBrush* scratchBrush = nullptr; // one reusable fill/stroke brush, recolored per draw call
+    ID2D1Layer* scratchLayer = nullptr; // one reusable clip layer for PushLayer/PopLayer (period cards' rounded-corner clip)
 
     IDWriteTextFormat* fmtClock = nullptr;
     IDWriteTextFormat* fmtDate = nullptr;
@@ -402,10 +403,11 @@ void createDeviceIndependentResources() {
 }
 
 void discardDeviceResources() {
-    // scratchBrush is created against renderTarget, so it must die with it --
-    // otherwise the next brush() call would hand back a brush bound to a
-    // released device (D2DERR_RECREATE_TARGET path).
+    // scratchBrush/scratchLayer are created against renderTarget, so they must
+    // die with it -- otherwise the next brush()/pushCardClip() call would hand
+    // back a resource bound to a released device (D2DERR_RECREATE_TARGET path).
     if (g->scratchBrush) { g->scratchBrush->Release(); g->scratchBrush = nullptr; }
+    if (g->scratchLayer) { g->scratchLayer->Release(); g->scratchLayer = nullptr; }
     if (g->renderTarget) { g->renderTarget->Release(); g->renderTarget = nullptr; }
 }
 
@@ -427,6 +429,20 @@ ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
     if (!g->scratchBrush) g->renderTarget->CreateSolidColorBrush(c, &g->scratchBrush);
     else g->scratchBrush->SetColor(c);
     return g->scratchBrush;
+}
+
+// Pushes a clip shaped like a rounded rectangle, so plain (square-cornered)
+// fills drawn afterward only show their rounded silhouette at the true outer
+// edge -- used to fuse a period card's header/content halves into one shape
+// with a perfectly flat, gapless seam between them (see the period-row loop).
+// Must be paired with a matching PopLayer(); reuses one Layer object like
+// brush() reuses one Brush, since PushLayer/PopLayer calls never nest here.
+void pushRoundedClip(D2D1_RECT_F r, float radius) {
+    ID2D1RoundedRectangleGeometry* geom = nullptr;
+    g->d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, radius, radius), &geom);
+    if (!g->scratchLayer) g->renderTarget->CreateLayer(nullptr, &g->scratchLayer);
+    g->renderTarget->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), geom), g->scratchLayer);
+    if (geom) geom->Release();
 }
 
 void roundedRect(D2D1_RECT_F r, float radius, D2D1_COLOR_F fill, D2D1_COLOR_F* border = nullptr) {
@@ -1467,37 +1483,37 @@ void drawFrame(HWND hwnd) {
                 roundedRect(row, 12, hex(kHyoBlue, 0.09f), &pal.cardBorder);
             }
 
-            // Two-tier card: an accent header pill ("1교시 (08:40~10:00)") above
-            // a content box ("국어(80분)") below it, separated by a fixed 3mm
-            // gap. Header and content each get exactly half the available
-            // height (5:5) and, since they share the same height and the same
-            // sizing ratio below, end up with the same font size too.
-            float headerContentGap = 3.0f * kDipPerMm;
-            float availH = rowH - rowGapPx;
-            float boxH = (availH - headerContentGap) / 2.0f;
-            D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + boxH);
-            D2D1_RECT_F content = D2D1::RectF(row.left, header.bottom + headerContentGap, row.right, row.bottom);
+            // Two-tier card: an accent header pill ("1교시 (08:40~10:00)") fused
+            // directly onto a content box ("국어(80분)") below it -- single
+            // brand color, no gap between them, so the pair reads as ONE card
+            // per period; separation between *different* periods comes from
+            // the row-to-row spacing (rowGapPx), not color variety (a
+            // per-period rainbow turned out to read as visual noise, not
+            // clarity). Rounding only the OUTER silhouette (not each half
+            // independently) needs a clip: fill two plain, square-cornered
+            // rects for header/content inside a rounded-rect clip layer, so
+            // the only curves are the card's actual outer corners and the
+            // header/content seam is a perfectly flat, gapless line.
+            float boxH = (rowH - rowGapPx) / 2.0f;
             float radius = g->fullscreen ? 14.0f : 10.0f;
+            D2D1_RECT_F full = D2D1::RectF(row.left, row.top, row.right, row.bottom);
+            D2D1_RECT_F header = D2D1::RectF(row.left, row.top, row.right, row.top + boxH);
+            D2D1_RECT_F content = D2D1::RectF(row.left, row.top + boxH, row.right, row.bottom);
 
-            // Each period cycles through a distinct brand accent color (rather
-            // than every card sharing the same blue) so "1교시, 2교시, ..." read
-            // apart at a glance -- keyed to the period's own index (idx), not
-            // its on-screen slot, so a color doesn't jump around mid-drag.
-            constexpr UINT32 kPeriodPalette[] = { kHyoBlue, kPurple, kOrange, kTeal };
-            UINT32 periodColor = kPeriodPalette[idx % (int)(sizeof(kPeriodPalette) / sizeof(kPeriodPalette[0]))];
+            D2D1_COLOR_F contentFill = isCurrent ? hex(kHyoBlue, 0.14f) : pal.surface;
+            D2D1_COLOR_F headerFill = isBeingDragged || isCurrent ? hex(kHyoBlue) : hex(kHyoBlueDark);
 
-            D2D1_COLOR_F contentFill = isCurrent ? hex(periodColor, 0.14f) : pal.surface;
-            D2D1_COLOR_F contentBorder = hex(periodColor, isCurrent ? 0.7f : 0.4f);
-            roundedRect(content, radius, contentFill, &contentBorder);
+            pushRoundedClip(full, radius);
+            g->renderTarget->FillRectangle(content, brush(contentFill));
+            g->renderTarget->FillRectangle(header, brush(headerFill));
+            g->renderTarget->PopLayer();
 
-            D2D1_COLOR_F headerFill = isBeingDragged ? hex(kHyoBlue, 0.9f) : hex(periodColor, isCurrent ? 1.0f : 0.85f);
-            roundedRect(header, radius, headerFill);
+            D2D1_COLOR_F cardBorder = isCurrent ? hex(kHyoBlue, 0.7f) : pal.cardBorder;
+            g->renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(full, radius, radius), brush(cardBorder), 1.5f);
 
-            // The currently-running period still needs its own "this one, now"
-            // cue distinct from the identity coloring above -- a bright outline
-            // around the whole two-box card.
+            // The currently-running period still gets its own "this one, now"
+            // cue -- a bright outline around the whole fused card.
             if (isCurrent && !isBeingDragged) {
-                D2D1_RECT_F full = D2D1::RectF(row.left, row.top, row.right, row.bottom);
                 g->renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(full, radius, radius), brush(hex(0xFFFFFF, 0.6f)), 2.0f);
             }
 
@@ -1513,7 +1529,7 @@ void drawFrame(HWND hwnd) {
             drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
                 headerBox, headerFontSize, DWRITE_FONT_WEIGHT_BOLD, hex(0xFFFFFF));
             drawFittedCenteredText(p.subject + L"(" + std::to_wstring(p.durationMinutes) + L"분)",
-                contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(periodColor) : pal.textPrimary);
+                contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
 
             if (!g->fullscreen) {
                 // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
