@@ -1312,7 +1312,7 @@ void drawFrame(HWND hwnd) {
     // badge tried earlier is reverted per request). The date's own font is
     // 1.3x its normal size (좌측 상단 영역, i.e. this clock-card area).
     float clockCenterY = clockCard.top + (clockCard.bottom - clockCard.top) / 2.0f;
-    IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, fDate->GetFontSize() * 1.3f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* dateFmt = makeFormat(kUiFontFamily, fDate->GetFontSize() * 1.6f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     float dateLineH = dateFmt->GetFontSize() * 1.3f;
     float clockLineH = fClock->GetFontSize() * 1.15f;
     // Halved again per request (was 0.12).
@@ -1521,10 +1521,12 @@ void drawFrame(HWND hwnd) {
             D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
             D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
-            // Same ratio for both, applied to the same box height -> same font
-            // size, plus a flat +13pt on top of that (per request).
-            float headerFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f) + 13.0f;
-            float contentFontSize = std::clamp(boxH * 0.42f, 12.0f, 100.0f) + 13.0f;
+            // Header (교시+시간) is now deliberately the larger of the two -- a
+            // big base so it's limited only by width and renders as large as the
+            // card allows; the content (과목) sits a step smaller beneath it. Both
+            // still auto-shrink to fit the width on one line.
+            float headerFontSize = std::clamp(boxH * 0.62f, 12.0f, 130.0f) + 13.0f;
+            float contentFontSize = std::clamp(boxH * 0.34f, 12.0f, 90.0f) + 9.0f;
 
             drawFittedCenteredText(p.label + L" (" + p.start.format() + L"~" + p.end.format() + L")",
                 headerBox, headerFontSize, DWRITE_FONT_WEIGHT_BOLD, hex(0xFFFFFF));
