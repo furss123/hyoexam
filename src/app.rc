@@ -4,8 +4,8 @@
 IDI_APPICON ICON "../assets/hyoexam.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,8,0
- PRODUCTVERSION 1,0,8,0
+ FILEVERSION 1,0,9,0
+ PRODUCTVERSION 1,0,9,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "HyoT"
       VALUE "FileDescription", "HyoExam - exam-day clock & timetable"
-      VALUE "FileVersion", "1.0.8.0"
+      VALUE "FileVersion", "1.0.9.0"
       VALUE "InternalName", "HyoExam"
       VALUE "LegalCopyright", "\251 2026 HyoT. All rights reserved."
       VALUE "OriginalFilename", "HyoExam.exe"
       VALUE "ProductName", "HyoExam"
-      VALUE "ProductVersion", "1.0.8.0"
+      VALUE "ProductVersion", "1.0.9.0"
     END
   END
   BLOCK "VarFileInfo"
