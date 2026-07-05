@@ -1518,7 +1518,12 @@ void drawFrame(HWND hwnd) {
             }
 
             float insetX = g->fullscreen ? 20.0f : 10.0f;
-            D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
+            // Windowed shows a small delete-X in the header's top-right corner;
+            // reserve a symmetric gutter for it so the centered header label
+            // never runs under the X and stays aligned with the subject below.
+            float delSize = 26.0f;
+            float actionGutter = g->fullscreen ? 0.0f : (delSize + 6.0f);
+            D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX + actionGutter, header.top, header.right - insetX - actionGutter, header.bottom);
             D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
             // Header (교시+시간) is now deliberately the larger of the two -- a
@@ -1534,11 +1539,20 @@ void drawFrame(HWND hwnd) {
                 contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
 
             if (!g->fullscreen) {
-                // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
-                float rowCenterY = (row.top + row.bottom) / 2.0f;
-                D2D1_RECT_F delBtn = D2D1::RectF(row.right - 45, rowCenterY - 19.5f, row.right - 6, rowCenterY + 19.5f);
-                roundedRect(delBtn, 12, withAlpha(pal.error, 0.14f));
-                text(L"", delBtn, g->fmtIconBox, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+                // Delete-X tucked into the header's top-right corner, inside the
+                // reserved gutter. Low-emphasis by default (a faint white glyph
+                // on the accent header) so it doesn't compete with the card;
+                // when the row is hovered it becomes a clear red X on a white
+                // chip -- an unmistakable, clean hit target.
+                float cy = (header.top + header.bottom) / 2.0f;
+                D2D1_RECT_F delBtn = D2D1::RectF(header.right - insetX - delSize, cy - delSize / 2.0f,
+                    header.right - insetX, cy + delSize / 2.0f);
+                if (isHovered) {
+                    roundedRect(delBtn, 8, hex(0xFFFFFF, 0.92f));
+                    text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+                } else {
+                    text(L"", delBtn, g->fmtIcon, hex(0xFFFFFF, 0.55f), DWRITE_TEXT_ALIGNMENT_CENTER);
+                }
                 g->periodDeleteRects[idx] = delBtn;
             }
             g->periodRowRects[idx] = row;
