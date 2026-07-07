@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <fstream>
 #include <sstream>
+#include <cctype>
 
 namespace hyo {
 
@@ -30,10 +31,17 @@ std::wstring TimeOfDay::format() const {
 
 TimeOfDay TimeOfDay::parse(const std::string& hhmm) {
     TimeOfDay t;
-    if (hhmm.size() >= 5) {
+    if (hhmm.size() >= 5 &&
+        std::isdigit((unsigned char)hhmm[0]) &&
+        std::isdigit((unsigned char)hhmm[1]) &&
+        hhmm[2] == ':' &&
+        std::isdigit((unsigned char)hhmm[3]) &&
+        std::isdigit((unsigned char)hhmm[4])) {
         t.hour = std::stoi(hhmm.substr(0, 2));
         t.minute = std::stoi(hhmm.substr(3, 2));
     }
+    if (t.hour < 0 || t.hour > 23) t.hour = 0;
+    if (t.minute < 0 || t.minute > 59) t.minute = 0;
     return t;
 }
 
@@ -107,7 +115,11 @@ void ScheduleStore::fromJson(const hyo::json::Value& root) {
         schedules_.push_back(parseSchedule(sv));
     }
     activeId_ = utf8ToWide(root["activeId"].asString());
-    if (activeId_.empty() && !schedules_.empty()) activeId_ = schedules_[0].id;
+    bool activeExists = false;
+    for (const auto& sc : schedules_) {
+        if (sc.id == activeId_) { activeExists = true; break; }
+    }
+    if (!activeExists && !schedules_.empty()) activeId_ = schedules_[0].id;
 }
 
 hyo::json::Value ScheduleStore::toJson() const {

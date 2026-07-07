@@ -20,6 +20,10 @@ namespace {
         WinsockInit() { WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); }
         ~WinsockInit() { WSACleanup(); }
     };
+
+    void ensureWinsockInit() {
+        static WinsockInit wsInit;
+    }
 }
 
 TimeSync::TimeSync() : host_(L"time.navyism.com") {}
@@ -45,6 +49,7 @@ std::wstring TimeSync::currentHost() {
 
 void TimeSync::start() {
     if (running_.exchange(true)) return;
+    ensureWinsockInit();
     // One blocking fetch before the background loop starts, so the app opens
     // already synced instead of showing "동기화 대기중" for the first tick.
     // Bounded by kRequestTimeoutMs (3s) on failure/no network.
@@ -62,7 +67,7 @@ void TimeSync::stop() {
 }
 
 void TimeSync::run() {
-    static WinsockInit wsInit; // one-time WSAStartup/WSACleanup for the process
+    ensureWinsockInit();
     while (running_.load(std::memory_order_relaxed)) {
         long long offset = 0;
         if (fetchSntpOffset(currentHost(), offset)) {
