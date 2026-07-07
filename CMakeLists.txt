@@ -15,6 +15,7 @@ endif()
 
 add_executable(HyoExam WIN32
   src/main.cpp
+  src/update.cpp
   src/time_sync.cpp
   src/schedule.cpp
   src/settings.cpp
@@ -30,6 +31,8 @@ target_link_libraries(HyoExam PRIVATE
   windowscodecs
   shlwapi
   comctl32
+  urlmon
+  bcrypt
 )
 
 add_custom_command(TARGET HyoExam POST_BUILD

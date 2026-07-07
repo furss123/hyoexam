@@ -15,6 +15,7 @@
 #include <vector>
 #include <ctime>
 #include <cwchar>
+#include <cwctype>
 #include <cstdlib>
 #include <algorithm>
 #include <fstream>
@@ -23,6 +24,7 @@
 #include "schedule.h"
 #include "settings.h"
 #include "time_sync.h"
+#include "update.h"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -2266,6 +2268,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g->cursorHiddenInFullscreen) ShowCursor(TRUE); // never leave the system cursor hidden on exit
         PostQuitMessage(0);
         return 0;
+    case WM_HYO_UPDATE_READY:
+    {
+        auto* update = reinterpret_cast<PreparedUpdate*>(lParam);
+        if (!update) return 0;
+        std::wstring lower = update->path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        bool installer = lower.ends_with(L".msi") || lower.ends_with(L".exe");
+        std::wstring message = installer
+            ? (L"HyoExam " + update->version + L" update is ready.\nRestart now to update?")
+            : (L"HyoExam " + update->version + L" update package is ready.\nOpen the downloaded package?");
+        int answer = MessageBoxW(hwnd, message.c_str(), L"HyoExam Update", MB_YESNO | MB_ICONINFORMATION);
+        if (answer == IDYES) {
+            if (lower.ends_with(L".msi")) {
+                std::wstring args = L"/i \"" + update->path + L"\" /quiet /norestart";
+                ShellExecuteW(hwnd, L"open", L"msiexec.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            } else if (lower.ends_with(L".exe")) {
+                ShellExecuteW(hwnd, L"open", update->path.c_str(), L"/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-", nullptr, SW_SHOWNORMAL);
+            } else if (lower.ends_with(L".zip")) {
+                std::wstring args = L"/select,\"" + update->path + L"\"";
+                ShellExecuteW(hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            } else {
+                ShellExecuteW(hwnd, L"open", update->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            if (installer) DestroyWindow(hwnd);
+        }
+        delete update;
+        return 0;
+    }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -2309,6 +2339,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd); // Starts windowed on the main (admin) screen; F11 for the TV/projector fullscreen display.
+    StartUpdateCheck(hwnd, kAppVersion);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
