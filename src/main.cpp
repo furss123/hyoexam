@@ -35,7 +35,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.9";
+constexpr wchar_t kAppVersion[] = L"1.0.10";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
