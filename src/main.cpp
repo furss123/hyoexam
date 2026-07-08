@@ -15,6 +15,7 @@
 #include <vector>
 #include <ctime>
 #include <cwchar>
+#include <cwctype>
 #include <cstdlib>
 #include <algorithm>
 #include <fstream>
@@ -23,6 +24,7 @@
 #include "schedule.h"
 #include "settings.h"
 #include "time_sync.h"
+#include "update.h"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -35,7 +37,7 @@ using namespace hyo;
 
 namespace {
 
-constexpr wchar_t kAppVersion[] = L"1.0.9";
+constexpr wchar_t kAppVersion[] = L"1.0.10";
 constexpr wchar_t kWindowClass[] = L"HyoExamWindowClass";
 constexpr UINT_PTR kTickTimerId = 1;
 constexpr UINT kTickIntervalMs = 250;
@@ -1518,7 +1520,12 @@ void drawFrame(HWND hwnd) {
             }
 
             float insetX = g->fullscreen ? 20.0f : 10.0f;
-            D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX, header.top, header.right - insetX, header.bottom);
+            // Windowed shows a small delete-X in the header's top-right corner;
+            // reserve a symmetric gutter for it so the centered header label
+            // never runs under the X and stays aligned with the subject below.
+            float delSize = 26.0f;
+            float actionGutter = g->fullscreen ? 0.0f : (delSize + 6.0f);
+            D2D1_RECT_F headerBox = D2D1::RectF(header.left + insetX + actionGutter, header.top, header.right - insetX - actionGutter, header.bottom);
             D2D1_RECT_F contentBox = D2D1::RectF(content.left + insetX, content.top, content.right - insetX, content.bottom);
 
             // Header (교시+시간) is now deliberately the larger of the two -- a
@@ -1534,11 +1541,20 @@ void drawFrame(HWND hwnd) {
                 contentBox, contentFontSize, DWRITE_FONT_WEIGHT_BOLD, isCurrent ? hex(kHyoBlue) : pal.textPrimary);
 
             if (!g->fullscreen) {
-                // Delete-X hit box is 1.5x the original 26px, matching the other enlarged icon boxes.
-                float rowCenterY = (row.top + row.bottom) / 2.0f;
-                D2D1_RECT_F delBtn = D2D1::RectF(row.right - 45, rowCenterY - 19.5f, row.right - 6, rowCenterY + 19.5f);
-                roundedRect(delBtn, 12, withAlpha(pal.error, 0.14f));
-                text(L"", delBtn, g->fmtIconBox, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+                // Delete-X tucked into the header's top-right corner, inside the
+                // reserved gutter. Low-emphasis by default (a faint white glyph
+                // on the accent header) so it doesn't compete with the card;
+                // when the row is hovered it becomes a clear red X on a white
+                // chip -- an unmistakable, clean hit target.
+                float cy = (header.top + header.bottom) / 2.0f;
+                D2D1_RECT_F delBtn = D2D1::RectF(header.right - insetX - delSize, cy - delSize / 2.0f,
+                    header.right - insetX, cy + delSize / 2.0f);
+                if (isHovered) {
+                    roundedRect(delBtn, 8, hex(0xFFFFFF, 0.92f));
+                    text(L"", delBtn, g->fmtIcon, pal.error, DWRITE_TEXT_ALIGNMENT_CENTER);
+                } else {
+                    text(L"", delBtn, g->fmtIcon, hex(0xFFFFFF, 0.55f), DWRITE_TEXT_ALIGNMENT_CENTER);
+                }
                 g->periodDeleteRects[idx] = delBtn;
             }
             g->periodRowRects[idx] = row;
@@ -2252,6 +2268,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g->cursorHiddenInFullscreen) ShowCursor(TRUE); // never leave the system cursor hidden on exit
         PostQuitMessage(0);
         return 0;
+    case WM_HYO_UPDATE_READY:
+    {
+        auto* update = reinterpret_cast<PreparedUpdate*>(lParam);
+        if (!update) return 0;
+        std::wstring lower = update->path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        bool installer = lower.ends_with(L".msi") || lower.ends_with(L".exe");
+        std::wstring message = installer
+            ? (L"HyoExam " + update->version + L" update is ready.\nRestart now to update?")
+            : (L"HyoExam " + update->version + L" update package is ready.\nOpen the downloaded package?");
+        int answer = MessageBoxW(hwnd, message.c_str(), L"HyoExam Update", MB_YESNO | MB_ICONINFORMATION);
+        if (answer == IDYES) {
+            if (lower.ends_with(L".msi")) {
+                std::wstring args = L"/i \"" + update->path + L"\" /quiet /norestart";
+                ShellExecuteW(hwnd, L"open", L"msiexec.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            } else if (lower.ends_with(L".exe")) {
+                ShellExecuteW(hwnd, L"open", update->path.c_str(), L"/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-", nullptr, SW_SHOWNORMAL);
+            } else if (lower.ends_with(L".zip")) {
+                std::wstring args = L"/select,\"" + update->path + L"\"";
+                ShellExecuteW(hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            } else {
+                ShellExecuteW(hwnd, L"open", update->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            if (installer) DestroyWindow(hwnd);
+        }
+        delete update;
+        return 0;
+    }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -2295,6 +2339,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd); // Starts windowed on the main (admin) screen; F11 for the TV/projector fullscreen display.
+    StartUpdateCheck(hwnd, kAppVersion);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {

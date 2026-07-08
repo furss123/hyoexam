@@ -88,8 +88,7 @@ cmake -S . -B build -G "NMake Makefiles"
 cmake --build build
 ```
 
-빌드 결과: `build\HyoExam.exe`. 실행 파일 옆에 `data\schedules.json`이 있어야 합니다
-(CMake가 자동 복사하지 않으므로, 배포 시 `data\` 폴더를 exe와 함께 배치할 것).
+빌드 결과: `build\HyoExam.exe`. CMake가 실행 파일 옆에 `data\` 폴더를 자동 복사합니다.
 
 ## 데이터 파일
 
